@@ -83,6 +83,8 @@ pub struct Flip {
     pub num_particles: u32,
 
     pub mac_density: Vec<f32>,
+    pub smoothed_density: Vec<f32>,
+    pub old_density: Vec<f32>,
 
     pub mac_pressure_grid: Vec<f32>,
     pub mac_grid_u: Vec<f32>,
@@ -143,6 +145,8 @@ impl Flip {
         flip.next_valid_v.resize((flip.cells + flip.width) as usize, false);
 
         flip.mac_density.resize(flip.cells as usize, 0.0);
+        flip.smoothed_density.resize(flip.cells as usize, 0.0);
+        flip.old_density.resize(flip.cells as usize, 0.0);
 
         flip.smoothed_error.resize(flip.cells as usize, 0.0);
         flip.current_error.resize(flip.cells as usize, 0.0);
@@ -632,27 +636,27 @@ impl Flip {
         self.plus_x_laplacian.fill(0.0);
         self.plus_y_laplacian.fill(0.0);
 
-        let mut smoothed_density = self.mac_density.clone();
-        let w = self.width as usize;
-        let mut old = smoothed_density.clone();
+        self.smoothed_density.copy_from_slice(&self.mac_density);
+        self.old_density.copy_from_slice(&self.mac_density);
+        let width = self.width as usize;
 
         for _ in 0..3 {
-            std::mem::swap(&mut smoothed_density, &mut old);    
+            std::mem::swap(&mut self.smoothed_density, &mut self.old_density);    
             for fluid_mask_index in 0..self.mac_type_fluid.len() {
                 let mut fluid_mask = self.mac_type_fluid[fluid_mask_index];
 
                 while fluid_mask != 0 {
                     let index = (fluid_mask_index * 64) + (fluid_mask.trailing_zeros() as usize);
                                         
-                    let mut sum = old[index] * 4.0;
+                    let mut sum = self.old_density[index] * 4.0;
                     let mut weight = 4.0;
                     
-                    if self.is_fluid_index(index - 1) == 1 { sum += old[index - 1]; weight += 1.0; }
-                    if self.is_fluid_index(index + 1) == 1 { sum += old[index + 1]; weight += 1.0; }
-                    if self.is_fluid_index(index - w) == 1 { sum += old[index - w]; weight += 1.0; }
-                    if self.is_fluid_index(index + w) == 1 { sum += old[index + w]; weight += 1.0; }
+                    if self.is_fluid_index(index - 1) == 1 { sum += self.old_density[index - 1]; weight += 1.0; }
+                    if self.is_fluid_index(index + 1) == 1 { sum += self.old_density[index + 1]; weight += 1.0; }
+                    if self.is_fluid_index(index - width) == 1 { sum += self.old_density[index - width]; weight += 1.0; }
+                    if self.is_fluid_index(index + width) == 1 { sum += self.old_density[index + width]; weight += 1.0; }
                     
-                    smoothed_density[index] = sum / weight;
+                    self.smoothed_density[index] = sum / weight;
 
                     fluid_mask &= fluid_mask - 1;
                 }
@@ -689,7 +693,7 @@ impl Flip {
                 let fluid_top = self.is_fluid(grid_x as i32, grid_y as i32 + 1);
 
                 let target_density = 9.0; 
-                let density_excess = (smoothed_density[fluid_index] - target_density).max(0.0).min(target_density);
+                let density_excess = (self.smoothed_density[fluid_index] - target_density).max(0.0).min(target_density);
                 let correction_rate = 0.2;
 
                 self.current_error[fluid_index] = -divergence * self.cell_size 
@@ -1005,7 +1009,7 @@ impl Flip {
         }
     }
 
-    pub fn transfer_grid_to_particles(&mut self) {
+    pub fn transfer_grid_to_particles(&mut self, deltatime: f32) {
         for chunk_index in 0..self.num_chunks as usize {
             let positions = self.part_positions[chunk_index];
 
