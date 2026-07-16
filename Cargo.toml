@@ -1,0 +1,25 @@
+[package]
+name = "FLIP"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.1"
+macroquad = "0.4.15"
+rayon = "1.12.0"
+ultraviolet = "0.10.0"
+wide = "0.7.33"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[dev-dependencies]
+criterion = "0.4"
+
+[[bench]]
+name = "fluid_benchmark"
+harness = false
