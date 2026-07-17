@@ -1,5 +1,6 @@
 use std::mem;
 
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use ultraviolet::{Vec2, Vec2x8};
 use wide::{CmpGt, CmpLt, f32x8, i32x8, u32x8};
 
@@ -81,6 +82,9 @@ pub struct Flip {
     pub cell_size: f32,
     pub num_chunks: u32,
     pub num_particles: u32,
+
+    pub external_force_u: Vec<f32>,
+    pub external_force_v: Vec<f32>,
 
     pub mac_density: Vec<f32>,
     pub smoothed_density: Vec<f32>,
@@ -164,6 +168,9 @@ impl Flip {
         flip.part_c_v.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.num_chunks = flip.cells / 2;
 
+        flip.external_force_u.resize((flip.cells + flip.height) as usize, 0.0);
+        flip.external_force_v.resize((flip.cells + flip.width) as usize, 0.0);
+
         let mut initial_positions = Vec::new();
         for y in 0..height {
             for x in 0..width {
@@ -226,22 +233,6 @@ impl Flip {
 
 
     #[inline(always)]
-    fn u_index_simd(&self, i: i32x8, j: i32x8) -> u32x8 {
-        let clamped_i: u32x8 = bytemuck::cast(i.min(i32x8::splat(self.width as i32)).max(i32x8::ZERO));
-        let clamped_j: u32x8 = bytemuck::cast(j.min(i32x8::splat ((self.height - 1) as i32)).max(i32x8::ZERO));
-        return (clamped_j * u32x8::splat(self.width as u32 + 1)) + clamped_i;
-    }
-
-
-    #[inline(always)]
-    fn v_index_simd(&self, i: i32x8, j: i32x8) -> u32x8 {
-        let clamped_i: u32x8 = bytemuck::cast(i.min(i32x8::splat((self.width - 1) as i32)).max(i32x8::ZERO));
-        let clamped_j: u32x8 = bytemuck::cast(j.min(i32x8::splat(self.height as i32)).max(i32x8::ZERO));
-        
-        return (clamped_j * u32x8::splat(self.width as u32)) + clamped_i; 
-    }
-
-    #[inline(always)]
     fn u_index(&self, i: i32, j: i32) -> u32 {
         let clamped_i: u32 = i.min(self.width as i32).max(0) as u32;
         let clamped_j: u32 = j.min(((self.height - 1) as i32)).max(0) as u32;
@@ -283,13 +274,28 @@ impl Flip {
 
     #[inline(always)]
     pub fn is_fluid_index(&self, index: usize) -> u64 {
-        let fluid = self.mac_type_fluid[(index / 64) as usize];
-
-        return 1 & (fluid >> (index % 64));
+        unsafe {
+            let fluid = *self.mac_type_fluid.get_unchecked(index >> 6);
+            1 & (fluid >> (index & 63))
+        }
     }
 
     #[inline(always)]
-    fn get_u_grid(&self, grid_space_positions: Vec2x8) -> (f32x8, f32x8, f32x8, f32x8, u32x8, u32x8, u32x8, u32x8, f32x8, f32x8) {
+    fn u_index_simd(width: u32, height: u32, i: i32x8, j: i32x8) -> u32x8 {
+        let clamped_i: u32x8 = bytemuck::cast(i.min(i32x8::splat(width as i32)).max(i32x8::ZERO));
+        let clamped_j: u32x8 = bytemuck::cast(j.min(i32x8::splat((height - 1) as i32)).max(i32x8::ZERO));
+        return (clamped_j * u32x8::splat(width as u32 + 1)) + clamped_i;
+    }
+
+    #[inline(always)]
+    fn v_index_simd(width: u32, height: u32, i: i32x8, j: i32x8) -> u32x8 {
+        let clamped_i: u32x8 = bytemuck::cast(i.min(i32x8::splat((width - 1) as i32)).max(i32x8::ZERO));
+        let clamped_j: u32x8 = bytemuck::cast(j.min(i32x8::splat(height as i32)).max(i32x8::ZERO));
+        return (clamped_j * u32x8::splat(width as u32)) + clamped_i; 
+    }
+
+    #[inline(always)]
+    fn get_u_grid(width: u32, height: u32, grid_space_positions: Vec2x8) -> (f32x8, f32x8, f32x8, f32x8, u32x8, u32x8, u32x8, u32x8, f32x8, f32x8) {
         let half = f32x8::splat(0.5);
         let one = f32x8::splat(1.0);
 
@@ -302,10 +308,10 @@ impl Flip {
         let u_base_x_index = u_base_x.fast_trunc_int();
         let u_base_y_index = u_base_y.fast_trunc_int();
 
-        let u_index_bottom_left = self.u_index_simd(u_base_x_index, u_base_y_index);
-        let u_index_bottom_right = self.u_index_simd(u_base_x_index + 1, u_base_y_index);
-        let u_index_top_left = self.u_index_simd(u_base_x_index, u_base_y_index + 1);
-        let u_index_top_right = self.u_index_simd(u_base_x_index + 1, u_base_y_index + 1);
+        let u_index_bottom_left = Flip::u_index_simd(width, height, u_base_x_index, u_base_y_index);
+        let u_index_bottom_right = Flip::u_index_simd(width, height, u_base_x_index + 1, u_base_y_index);
+        let u_index_top_left = Flip::u_index_simd(width, height, u_base_x_index, u_base_y_index + 1);
+        let u_index_top_right = Flip::u_index_simd(width, height, u_base_x_index + 1, u_base_y_index + 1);
 
         let u_tx = u_grid_x - u_base_x;
         let u_ty = u_grid_y - u_base_y;
@@ -330,7 +336,7 @@ impl Flip {
     }
 
     #[inline(always)]
-    fn get_v_grid(&self, grid_space_positions: Vec2x8) -> (f32x8, f32x8, f32x8, f32x8, u32x8, u32x8, u32x8, u32x8, f32x8, f32x8) {
+    fn get_v_grid(width: u32, height: u32, grid_space_positions: Vec2x8) -> (f32x8, f32x8, f32x8, f32x8, u32x8, u32x8, u32x8, u32x8, f32x8, f32x8) {
         let half = f32x8::splat(0.5);
         let one = f32x8::splat(1.0);
 
@@ -351,10 +357,11 @@ impl Flip {
         let v_base_x_index = v_base_x.fast_trunc_int();
         let v_base_y_index = v_base_y.fast_trunc_int();
 
-        let v_index_bottom_left = self.v_index_simd(v_base_x_index, v_base_y_index);
-        let v_index_bottom_right = self.v_index_simd(v_base_x_index + 1, v_base_y_index);
-        let v_index_top_left = self.v_index_simd(v_base_x_index, v_base_y_index + 1);
-        let v_index_top_right = self.v_index_simd(v_base_x_index + 1, v_base_y_index + 1);
+        // Call our static functions via Flip::
+        let v_index_bottom_left = Flip::v_index_simd(width, height, v_base_x_index, v_base_y_index);
+        let v_index_bottom_right = Flip::v_index_simd(width, height, v_base_x_index + 1, v_base_y_index);
+        let v_index_top_left = Flip::v_index_simd(width, height, v_base_x_index, v_base_y_index + 1);
+        let v_index_top_right = Flip::v_index_simd(width, height, v_base_x_index + 1, v_base_y_index + 1);
 
         return (
             v_weight_bottom_left,
@@ -371,8 +378,8 @@ impl Flip {
     }
 
     #[inline(always)]
-    fn get_grid_distances(&self, tx: f32x8, ty: f32x8) -> (f32x8, f32x8, f32x8, f32x8, f32x8, f32x8, f32x8, f32x8) {
-        let dx = f32x8::splat(self.cell_size);
+    fn get_grid_distances(cell_size: f32, tx: f32x8, ty: f32x8) -> (f32x8, f32x8, f32x8, f32x8, f32x8, f32x8, f32x8, f32x8) {
+        let dx = f32x8::splat(cell_size);
         let one = f32x8::splat(1.0);
 
         return (
@@ -449,7 +456,7 @@ impl Flip {
                 u_index_top_right,
                 u_tx,
                 u_ty,
-            ) = self.get_u_grid(grid_space_positions);
+            ) = Flip::get_u_grid(self.width, self.height, grid_space_positions);
 
             let (
                 u_diff_bottom_left_x,
@@ -460,7 +467,7 @@ impl Flip {
                 u_diff_top_left_y,
                 u_diff_top_right_x,
                 u_diff_top_right_y
-            ) = self.get_grid_distances(u_tx, u_ty);
+            ) = Flip::get_grid_distances(self.cell_size, u_tx, u_ty);
             
             // V GRID
             let (
@@ -474,7 +481,7 @@ impl Flip {
                 v_index_top_right,
                 v_tx,
                 v_ty,
-            ) = self.get_v_grid(grid_space_positions);
+            ) = Flip::get_v_grid(self.width, self.height, grid_space_positions);
 
             let (
                 v_diff_bottom_left_x,
@@ -485,7 +492,7 @@ impl Flip {
                 v_diff_top_left_y,
                 v_diff_top_right_x,
                 v_diff_top_right_y
-            ) = self.get_grid_distances(v_tx, v_ty);
+            ) = Flip::get_grid_distances(self.cell_size, v_tx, v_ty);
 
 
             
@@ -615,6 +622,13 @@ impl Flip {
 
     pub fn apply_external_forces(&mut self, deltatime: f32) {
         let gravity = self.world_properties.gravity * deltatime;
+
+        for i in 0..self.mac_grid_u.len() {
+            self.mac_grid_u[i] += self.external_force_u[i] * deltatime;
+        }
+        for i in 0..self.mac_grid_v.len() {
+            self.mac_grid_v[i] += self.external_force_v[i] * deltatime;
+        }
         
         for y in 0..=self.height as i32 {
             for x in 0..self.width as i32 {
@@ -631,7 +645,7 @@ impl Flip {
     }
 
 
-    pub fn build_pressure_system(&mut self, deltatime: f32) {
+    pub fn build_pressure_system(&mut self) {
         self.diag_laplacian.fill(0.0);
         self.plus_x_laplacian.fill(0.0);
         self.plus_y_laplacian.fill(0.0);
@@ -694,7 +708,7 @@ impl Flip {
 
                 let target_density = 9.0; 
                 let density_excess = (self.smoothed_density[fluid_index] - target_density).max(0.0).min(target_density);
-                let correction_rate = 0.2;
+                let correction_rate = 0.1;
 
                 self.current_error[fluid_index] = -divergence * self.cell_size 
                     + density_excess * correction_rate * self.cell_size * self.cell_size;
@@ -799,42 +813,26 @@ impl Flip {
 
                 let mut connection_x: f32 = 0.0;
                 let mut connection_y: f32 = 0.0;
+
+
+                let left_index = index - 1;
+                let bottom_index = index - self.width as usize;
+
+                let precon_x = self.precondition[left_index];
+                let connection_x = self.plus_x_laplacian[left_index] * precon_x;
+                diagonal -= connection_x * connection_x;
+                diagonal -= TUNING * (connection_x * self.plus_y_laplacian[left_index] * precon_x);
+
+                let precon_y = self.precondition[bottom_index];
+                let connection_y = self.plus_y_laplacian[bottom_index] * precon_y;
+                diagonal -= connection_y * connection_y;
+                diagonal -= TUNING * (connection_y * self.plus_x_laplacian[bottom_index] * precon_y);
+
+                ap_value += self.plus_x_laplacian[index] * self.mac_pressure_grid[index + 1];
+                ap_value += self.plus_x_laplacian[left_index] * self.mac_pressure_grid[left_index];
+                ap_value += self.plus_y_laplacian[index] * self.mac_pressure_grid[index + self.width as usize];
+                ap_value += self.plus_y_laplacian[bottom_index] * self.mac_pressure_grid[bottom_index];
                 
-                if x < self.width - 1 {
-                    ap_value += self.plus_x_laplacian[index] * self.mac_pressure_grid[index + 1];
-                }
-
-                if x > 0 {
-                    let left_index = index - 1;
-
-                    let precon_x = self.precondition[left_index];
-
-                    connection_x = self.plus_x_laplacian[left_index] * precon_x;
-
-                    diagonal -= connection_x * connection_x;
-                    
-                    diagonal -= TUNING * (connection_x * self.plus_y_laplacian[left_index] * precon_x);
-
-                    ap_value += self.plus_x_laplacian[left_index] * self.mac_pressure_grid[left_index];
-                }
-
-                if y < self.height - 1 {
-                    ap_value += self.plus_y_laplacian[index] * self.mac_pressure_grid[index + self.width as usize];
-                }
-
-                if y > 0 {
-                    let bottom_index = index - self.width as usize;
-
-                    let precon_y = self.precondition[bottom_index];
-
-                    connection_y = self.plus_y_laplacian[bottom_index] * precon_y;
-
-                    diagonal -= connection_y * connection_y;
-
-                    diagonal -= TUNING * (connection_y * self.plus_x_laplacian[bottom_index] * precon_y);
-
-                    ap_value += self.plus_y_laplacian[bottom_index] * self.mac_pressure_grid[bottom_index];
-                }
 
                 if diagonal < SAFTEY {
                     diagonal = self.diag_laplacian[index];
@@ -1009,11 +1007,27 @@ impl Flip {
         }
     }
 
-    pub fn transfer_grid_to_particles(&mut self, deltatime: f32) {
-        for chunk_index in 0..self.num_chunks as usize {
-            let positions = self.part_positions[chunk_index];
+    pub fn transfer_grid_to_particles_and_advect(&mut self, deltatime: f32) {
+        let dt = f32x8::splat(deltatime);
 
-            let grid_space_positions = positions / f32x8::splat(self.cell_size);
+        let min_x = f32x8::splat(1.001 * self.cell_size);
+        let max_x = f32x8::splat((self.width as f32 - 1.001) * self.cell_size);
+        let min_y = f32x8::splat(1.001 * self.cell_size);
+        let max_y = f32x8::splat((self.height as f32 - 1.001) * self.cell_size);
+
+        let zero = f32x8::ZERO;
+
+        let width = self.width;
+        let height = self.height;
+        let cell_size = self.cell_size;
+        
+        self.part_positions.par_iter_mut()
+            .zip(self.part_velocities.par_iter_mut())
+            .zip(self.part_c_u.par_iter_mut())
+            .zip(self.part_c_v.par_iter_mut())
+            .for_each(|(((positions, velocity), c_u_org), c_v_org)| {
+
+            let grid_space_positions = *positions / f32x8::splat(self.cell_size);
 
             // U GRID
             let (
@@ -1027,7 +1041,7 @@ impl Flip {
                 u_index_top_right,
                 u_tx,
                 u_ty,
-            ) = self.get_u_grid(grid_space_positions);
+            ) = Flip::get_u_grid(width, height, grid_space_positions);
 
             let (
                 u_diff_bottom_left_x,
@@ -1038,7 +1052,7 @@ impl Flip {
                 u_diff_top_left_y,
                 u_diff_top_right_x,
                 u_diff_top_right_y
-            ) = self.get_grid_distances(u_tx, u_ty);
+            ) = Flip::get_grid_distances(cell_size, u_tx, u_ty);
             
             // V GRID
             let (
@@ -1052,7 +1066,7 @@ impl Flip {
                 v_index_top_right,
                 v_tx,
                 v_ty,
-            ) = self.get_v_grid(grid_space_positions);
+            ) = Flip::get_v_grid(width, height, grid_space_positions);
 
             let (
                 v_diff_bottom_left_x,
@@ -1063,7 +1077,7 @@ impl Flip {
                 v_diff_top_left_y,
                 v_diff_top_right_x,
                 v_diff_top_right_y
-            ) = self.get_grid_distances(v_tx, v_ty);
+            ) = Flip::get_grid_distances(cell_size, v_tx, v_ty);
 
             let u_node_bl = gather_f32x8(&self.mac_grid_u, u_index_bottom_left);
             let u_node_br = gather_f32x8(&self.mac_grid_u, u_index_bottom_right);
@@ -1097,82 +1111,56 @@ impl Flip {
                 v_node_tr,
             );
 
-            unsafe {
-                *self.part_velocities.get_unchecked_mut(chunk_index) = Vec2x8 { x: u_velocity, y: v_velocity };
+            let mut new_velocity = Vec2x8 { x: u_velocity, y: v_velocity };
+            let mut new_positions =  *positions + dt * new_velocity;
 
-                let d_inv = f32x8::splat(4.0 / (self.cell_size * self.cell_size));
+            let out_x_min = new_positions.x.cmp_lt(min_x);
+            let out_x_max = new_positions.x.cmp_gt(max_x);
+            let out_y_min = new_positions.y.cmp_lt(min_y);
+            let out_y_max = new_positions.y.cmp_gt(max_y);
 
-                let mut c_u_x = f32x8::ZERO;
-                let mut c_u_y = f32x8::ZERO;
-                c_u_x += u_weight_bottom_left * u_node_bl * u_diff_bottom_left_x;
-                c_u_y += u_weight_bottom_left * u_node_bl * u_diff_bottom_left_y;
-                c_u_x += u_weight_bottom_right * u_node_br * u_diff_bottom_right_x;
-                c_u_y += u_weight_bottom_right * u_node_br * u_diff_bottom_right_y;
-                c_u_x += u_weight_top_left * u_node_tl * u_diff_top_left_x;
-                c_u_y += u_weight_top_left * u_node_tl * u_diff_top_left_y;
-                c_u_x += u_weight_top_right * u_node_tr * u_diff_top_right_x;
-                c_u_y += u_weight_top_right * u_node_tr * u_diff_top_right_y;
-
-                *self.part_c_u.get_unchecked_mut(chunk_index) = Vec2x8 { x: c_u_x * d_inv, y: c_u_y * d_inv };
-
-                let mut c_v_x = f32x8::ZERO;
-                let mut c_v_y = f32x8::ZERO;
-                c_v_x += v_weight_bottom_left * v_node_bl * v_diff_bottom_left_x;
-                c_v_y += v_weight_bottom_left * v_node_bl * v_diff_bottom_left_y;
-                c_v_x += v_weight_bottom_right * v_node_br * v_diff_bottom_right_x;
-                c_v_y += v_weight_bottom_right * v_node_br * v_diff_bottom_right_y;
-                c_v_x += v_weight_top_left * v_node_tl * v_diff_top_left_x;
-                c_v_y += v_weight_top_left * v_node_tl * v_diff_top_left_y;
-                c_v_x += v_weight_top_right * v_node_tr * v_diff_top_right_x;
-                c_v_y += v_weight_top_right * v_node_tr * v_diff_top_right_y;
-
-                *self.part_c_v.get_unchecked_mut(chunk_index) = Vec2x8 { x: c_v_x * d_inv, y: c_v_y * d_inv };
-            }
-        }
-    }
-
-    pub fn advect_particles(&mut self, deltatime: f32) {
-        let dt = f32x8::splat(deltatime);
-
-        let min_x = f32x8::splat(1.001 * self.cell_size);
-        let max_x = f32x8::splat((self.width as f32 - 1.001) * self.cell_size);
-        let min_y = f32x8::splat(1.001 * self.cell_size);
-        let max_y = f32x8::splat((self.height as f32 - 1.001) * self.cell_size);
-
-        let zero = f32x8::ZERO;
-
-        for chunk_index in 0..self.num_chunks as usize {
-            let mut positions = self.part_positions[chunk_index];
-            let mut velocities = self.part_velocities[chunk_index];
-
-            positions += dt * velocities;
-
-            let out_x_min = positions.x.cmp_lt(min_x);
-            let out_x_max = positions.x.cmp_gt(max_x);
-            let out_y_min = positions.y.cmp_lt(min_y);
-            let out_y_max = positions.y.cmp_gt(max_y);
-
-            let out_vel_x_min = out_x_min & velocities.x.cmp_lt(zero);
-            let out_vel_x_max = out_x_max & velocities.x.cmp_gt(zero);
-            let out_vel_y_min = out_y_min & velocities.y.cmp_lt(zero);
-            let out_vel_y_max = out_y_max & velocities.y.cmp_gt(zero);
+            let out_vel_x_min = out_x_min & new_velocity.x.cmp_lt(zero);
+            let out_vel_x_max = out_x_max & new_velocity.x.cmp_gt(zero);
+            let out_vel_y_min = out_y_min & new_velocity.y.cmp_lt(zero);
+            let out_vel_y_max = out_y_max & new_velocity.y.cmp_gt(zero);
 
 
-            positions.x = out_x_min.blend(min_x, positions.x);
-            positions.x = out_x_max.blend(max_x, positions.x);
-            velocities.x = out_vel_x_min.blend(velocities.x * f32x8::splat(-self.world_properties.border_damping), velocities.x);
-            velocities.x = out_vel_x_max.blend(velocities.x * f32x8::splat(-self.world_properties.border_damping), velocities.x);
+            new_positions.x = out_x_min.blend(min_x, new_positions.x);
+            new_positions.x = out_x_max.blend(max_x, new_positions.x);
+            new_velocity.x = out_vel_x_min.blend(new_velocity.x * f32x8::splat(-self.world_properties.border_damping), new_velocity.x);
+            new_velocity.x = out_vel_x_max.blend(new_velocity.x * f32x8::splat(-self.world_properties.border_damping), new_velocity.x);
 
-            positions.y = out_y_min.blend(min_y, positions.y);
-            positions.y = out_y_max.blend(max_y, positions.y);
-            velocities.y = out_vel_y_min.blend(velocities.y * f32x8::splat(-self.world_properties.border_damping), velocities.y);
-            velocities.y = out_vel_y_max.blend(velocities.y * f32x8::splat(-self.world_properties.border_damping), velocities.y);
+            new_positions.y = out_y_min.blend(min_y, new_positions.y);
+            new_positions.y = out_y_max.blend(max_y, new_positions.y);
+            new_velocity.y = out_vel_y_min.blend(new_velocity.y * f32x8::splat(-self.world_properties.border_damping), new_velocity.y);
+            new_velocity.y = out_vel_y_max.blend(new_velocity.y * f32x8::splat(-self.world_properties.border_damping), new_velocity.y);
 
-            self.part_positions[chunk_index] = positions;
-            self.part_velocities[chunk_index] = velocities;
+            let d_inv = f32x8::splat(4.0 / (self.cell_size * self.cell_size));
 
-            let mut c_u = self.part_c_u[chunk_index];
-            let mut c_v = self.part_c_v[chunk_index];
+            let mut c_u_x = f32x8::ZERO;
+            let mut c_u_y = f32x8::ZERO;
+            c_u_x += u_weight_bottom_left * u_node_bl * u_diff_bottom_left_x;
+            c_u_y += u_weight_bottom_left * u_node_bl * u_diff_bottom_left_y;
+            c_u_x += u_weight_bottom_right * u_node_br * u_diff_bottom_right_x;
+            c_u_y += u_weight_bottom_right * u_node_br * u_diff_bottom_right_y;
+            c_u_x += u_weight_top_left * u_node_tl * u_diff_top_left_x;
+            c_u_y += u_weight_top_left * u_node_tl * u_diff_top_left_y;
+            c_u_x += u_weight_top_right * u_node_tr * u_diff_top_right_x;
+            c_u_y += u_weight_top_right * u_node_tr * u_diff_top_right_y;
+
+            let mut c_v_x = f32x8::ZERO;
+            let mut c_v_y = f32x8::ZERO;
+            c_v_x += v_weight_bottom_left * v_node_bl * v_diff_bottom_left_x;
+            c_v_y += v_weight_bottom_left * v_node_bl * v_diff_bottom_left_y;
+            c_v_x += v_weight_bottom_right * v_node_br * v_diff_bottom_right_x;
+            c_v_y += v_weight_bottom_right * v_node_br * v_diff_bottom_right_y;
+            c_v_x += v_weight_top_left * v_node_tl * v_diff_top_left_x;
+            c_v_y += v_weight_top_left * v_node_tl * v_diff_top_left_y;
+            c_v_x += v_weight_top_right * v_node_tr * v_diff_top_right_x;
+            c_v_y += v_weight_top_right * v_node_tr * v_diff_top_right_y;
+
+            let mut c_u = Vec2x8 { x: c_u_x * d_inv, y: c_u_y * d_inv };
+            let mut c_v = Vec2x8 { x: c_v_x * d_inv, y: c_v_y * d_inv };
 
             let reflect_x = out_vel_x_min | out_vel_x_max;
             let reflect_y = out_vel_y_min | out_vel_y_max;
@@ -1183,31 +1171,36 @@ impl Flip {
             c_u.y = reflect_y.blend(c_u.y * negate, c_u.y);
             c_v.x = reflect_y.blend(c_v.x * negate, c_v.x);
 
-            self.part_c_u[chunk_index] = c_u;
-            self.part_c_v[chunk_index] = c_v;
-        }
+            *positions = new_positions;
+            *velocity = new_velocity;
+
+            *c_u_org = c_u;
+            *c_v_org = c_v;
+        });
     }
 
     pub fn extrapolate_velocity(&mut self) {
-        self.old_grid_u.copy_from_slice(&self.mac_grid_u);
-        self.old_grid_v.copy_from_slice(&self.mac_grid_v);
+        std::mem::swap(&mut self.mac_grid_u, &mut self.old_grid_u);
+        std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
 
         let width = self.width as usize;
         let height = self.height as usize;
 
-        for _ in 0..4 {
-            self.next_valid_u.copy_from_slice(&self.mac_valid_u);
+        for iter in 0..4 {
             for y in 0..height {
                 for x in 0..=width {
                     let index = y * (width + 1) + x;
 
-                    if !self.mac_valid_u[index] {
+                    if self.next_valid_u[index] {
+                        self.mac_grid_u[index] = self.old_grid_u[index];
+                        self.mac_valid_u[index] = true;
+                    } else {
                         let mut sum: f32 = 0.0;
                         let mut count: u32 = 0;
 
                         if x > 0 {
                             let new_index = index - 1;
-                            if self.mac_valid_u[new_index] {
+                            if self.next_valid_u[new_index] {
                                 sum += self.old_grid_u[new_index];
                                 count += 1;
                             }
@@ -1215,16 +1208,15 @@ impl Flip {
 
                         if x < width {
                             let new_index = index + 1;
-                            if self.mac_valid_u[new_index] {
+                            if self.next_valid_u[new_index] {
                                 sum += self.old_grid_u[new_index];
                                 count += 1;
                             }
-                        
                         }
 
                         if y > 0 {
                             let new_index = index - (width + 1);
-                            if self.mac_valid_u[new_index] {
+                            if self.next_valid_u[new_index] {
                                 sum += self.old_grid_u[new_index];
                                 count += 1;
                             }
@@ -1232,36 +1224,48 @@ impl Flip {
 
                         if y < height - 1 {
                             let new_index = index + width + 1;
-                            if self.mac_valid_u[new_index] {
+                            if self.next_valid_u[new_index] {
                                 sum += self.old_grid_u[new_index];
                                 count += 1;
                             }
                         }
 
+
                         if count > 0 {
                             self.mac_grid_u[index] = sum / (count as f32);
                             self.next_valid_u[index] = true;
+                        } else {
+                            self.mac_grid_u[index] = self.old_grid_u[index];
+                            self.mac_valid_u[index] = false;
                         }
                     }
                 }
             }
+            
+            if iter < 3 {
+                std::mem::swap(&mut self.mac_grid_u, &mut self.old_grid_u);
+                std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
+            }
+        }
+            
+        std::mem::swap(&mut self.mac_grid_v, &mut self.old_grid_v);
+        std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
 
-            self.mac_valid_u.copy_from_slice(&self.next_valid_u);
-            self.old_grid_u.copy_from_slice(&self.mac_grid_u);
-
-
-            self.next_valid_v.copy_from_slice(&self.mac_valid_v);
+        for iter in 0..4 {
             for y in 0..=height {
                 for x in 0..width {
                     let index = y * width + x;
 
-                    if !self.mac_valid_v[index] {
+                    if self.next_valid_v[index] {
+                        self.mac_grid_v[index] = self.old_grid_v[index];
+                        self.mac_valid_v[index] = true;
+                    } else {
                         let mut sum: f32 = 0.0;
                         let mut count: u32 = 0;
 
                         if x > 0 {
                             let new_index = index - 1;
-                            if self.mac_valid_v[new_index] {
+                            if self.next_valid_v[new_index] {
                                 sum += self.old_grid_v[new_index];
                                 count += 1;
                             }
@@ -1269,7 +1273,7 @@ impl Flip {
 
                         if x < width - 1 {
                             let new_index = index + 1;
-                            if self.mac_valid_v[new_index] {
+                            if self.next_valid_v[new_index] {
                                 sum += self.old_grid_v[new_index];
                                 count += 1;
                             }
@@ -1277,7 +1281,7 @@ impl Flip {
 
                         if y > 0 {
                             let new_index = index - width;
-                            if self.mac_valid_v[new_index] {
+                            if self.next_valid_v[new_index] {
                                 sum += self.old_grid_v[new_index];
                                 count += 1;
                             }
@@ -1285,7 +1289,7 @@ impl Flip {
 
                         if y < height {
                             let new_index = index + width;
-                            if self.mac_valid_v[new_index] {
+                            if self.next_valid_v[new_index] {
                                 sum += self.old_grid_v[new_index];
                                 count += 1;
                             }
@@ -1293,26 +1297,140 @@ impl Flip {
 
                         if count > 0 {
                             self.mac_grid_v[index] = sum / (count as f32);
-                            self.next_valid_v[index] = true;
+                            self.mac_valid_v[index] = true;
+                        } else {
+                            self.mac_grid_v[index] = self.old_grid_v[index];
+                            self.mac_valid_v[index] = false;
                         }
                     }
                 }
             }
 
-            self.mac_valid_v.copy_from_slice(&self.next_valid_v);
-            self.old_grid_v.copy_from_slice(&self.mac_grid_v);
+            if iter < 3 {
+                std::mem::swap(&mut self.mac_grid_v, &mut self.old_grid_v);
+                std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
+            }
         }
 
     }
 
-    pub fn update(&mut self, deltatime: f32) {
-        self.transfer_particles_to_grid();
-        self.apply_external_forces(deltatime);
-        self.build_pressure_system(deltatime);
-        self.solve_pcg();
-        self.apply_pressure_gradient();
-        self.extrapolate_velocity();
-        self.transfer_grid_to_particles();
-        self.advect_particles(deltatime);
+    pub fn add_radial_force(&mut self, world_x: f32, world_y: f32, radius: f32, strength: f32) {
+        let min_x = (((world_x - radius) / self.cell_size).floor() as i32).max(0) as u32;
+        let max_x = (((world_x + radius) / self.cell_size).ceil() as i32).min(self.width as i32) as u32;
+        let min_y = (((world_y - radius) / self.cell_size).floor() as i32).max(0) as u32;
+        let max_y = (((world_y + radius) / self.cell_size).ceil() as i32).min(self.height as i32) as u32;
+
+        let radius_sq = radius * radius;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                if x <= self.width && y < self.height {
+                    let u_world_x = (x as f32) * self.cell_size;
+                    let u_world_y = (y as f32 + 0.5) * self.cell_size;
+                    let dx = u_world_x - world_x;
+                    let dy = u_world_y - world_y;
+                    let dist_sq = dx * dx + dy * dy;
+
+                    if dist_sq < radius_sq && dist_sq > 1e-5 {
+                        let dist = dist_sq.sqrt();
+                        let falloff = 1.0 - (dist / radius);
+                        let dir_x = dx / dist;
+                        let u_idx = self.u_index(x as i32, y as i32) as usize;
+                        self.external_force_u[u_idx] += dir_x * strength * falloff;
+                    }
+                }
+                if x < self.width && y <= self.height {
+                    let v_world_x = (x as f32 + 0.5) * self.cell_size;
+                    let v_world_y = (y as f32) * self.cell_size;
+                    let dx = v_world_x - world_x;
+                    let dy = v_world_y - world_y;
+                    let dist_sq = dx * dx + dy * dy;
+
+                    if dist_sq < radius_sq && dist_sq > 1e-5 {
+                        let dist = dist_sq.sqrt();
+                        let falloff = 1.0 - (dist / radius);
+                        let dir_y = dy / dist;
+                        let v_idx = self.v_index(x as i32, y as i32) as usize;
+                        self.external_force_v[v_idx] += dir_y * strength * falloff;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn add_directional_force(&mut self, world_x: f32, world_y: f32, radius: f32, force_x: f32, force_y: f32) {
+        let min_x = (((world_x - radius) / self.cell_size).floor() as i32).max(0) as u32;
+        let max_x = (((world_x + radius) / self.cell_size).ceil() as i32).min(self.width as i32 - 1) as u32;
+        let min_y = (((world_y - radius) / self.cell_size).floor() as i32).max(0) as u32;
+        let max_y = (((world_y + radius) / self.cell_size).ceil() as i32).min(self.height as i32 - 1) as u32;
+
+        let radius_sq = radius * radius;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let cell_x = (x as f32 + 0.5) * self.cell_size;
+                let cell_y = (y as f32 + 0.5) * self.cell_size;
+                let dx = cell_x - world_x;
+                let dy = cell_y - world_y;
+                let dist_sq = dx * dx + dy * dy;
+
+                if dist_sq < radius_sq {
+                    let falloff = 1.0 - (dist_sq / radius_sq);
+                    let u_idx = self.u_index(x as i32, y as i32) as usize;
+                    let v_idx = self.v_index(x as i32, y as i32) as usize;
+                    
+                    self.external_force_u[u_idx] += force_x * falloff;
+                    self.external_force_v[v_idx] += force_y * falloff;
+                }
+            }
+        }
+    }
+
+    pub fn get_max_particle_velocity(&self) -> f32 {
+        let mut max_velocities = f32x8::ZERO;
+
+        for chunk_index in 0..self.num_chunks as usize {
+            let velocities = self.part_velocities[chunk_index];
+
+            max_velocities = max_velocities.fast_max(velocities.mag())
+        }
+
+        let mut max_velocity: f32 = 0.0;
+        for velocity in max_velocities.as_array_ref() {
+            max_velocity = max_velocity.max(*velocity);
+        }
+
+        return max_velocity;
+    }
+
+    pub fn update(&mut self, frame_deltatime: f32) {
+        let mut time_simulated = 0.0;
+
+        let cfl_number = 1.0; 
+    
+        while time_simulated < frame_deltatime {
+            let max_velocity = self.get_max_particle_velocity();
+            
+            let max_safe_dt = if max_velocity > 1e-5 {
+                cfl_number * self.cell_size / max_velocity
+            } else {
+                frame_deltatime
+            };
+
+            let step_deltatime = max_safe_dt.min(frame_deltatime - time_simulated);
+            
+            self.transfer_particles_to_grid();
+            self.apply_external_forces(step_deltatime);
+            self.build_pressure_system();
+            self.solve_pcg();
+            self.apply_pressure_gradient();
+            self.extrapolate_velocity();
+            self.transfer_grid_to_particles_and_advect(step_deltatime);
+            
+            time_simulated += step_deltatime;
+        }
+
+        self.external_force_u.fill(0.0);
+        self.external_force_v.fill(0.0);
     }
 }

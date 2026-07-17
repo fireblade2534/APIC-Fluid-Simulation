@@ -10,11 +10,10 @@ use macroquad::{
     },
     math::{vec2, Rect, Vec2 as MqVec2},
     text::draw_text,
-    texture::{draw_texture_ex, DrawTextureParams, Texture2D}, // Added texture functions
+    texture::{draw_texture_ex, DrawTextureParams, Texture2D},
     time::{get_fps, get_frame_time},
     window::{clear_background, next_frame, Conf},
 };
-use wide::{CmpLt, f32x8};
 
 const WIDTH: f32 = 1920.0;
 const HEIGHT: f32 = 1080.0;
@@ -50,7 +49,6 @@ async fn main() {
     );
 
     // --- Generate an Anti-Aliased Circle Texture on Startup ---
-    // This creates a smooth 32x32 white circle in memory.
     let texture_size = 32u16;
     let radius = texture_size as f32 / 2.0;
     let mut bytes = vec![0u8; (texture_size * texture_size * 4) as usize];
@@ -63,9 +61,6 @@ async fn main() {
             
             let idx = ((y * texture_size + x) * 4) as usize;
             
-            // Anything inside (radius - 1px) is completely solid
-            // Anything outside (radius) is completely transparent
-            // Anything in between is smoothly blended to avoid jagged pixels
             let alpha = if dist < radius - 1.0 {
                 255
             } else if dist < radius {
@@ -80,7 +75,7 @@ async fn main() {
             bytes[idx + 3] = alpha; // A
         }
     }
-    let circle_texture = Texture2D::from_rgba8(texture_size, texture_size, &bytes); //
+    let circle_texture = Texture2D::from_rgba8(texture_size, texture_size, &bytes);
 
     let mut camera = Camera2D::from_display_rect(Rect::new(0.0, HEIGHT, WIDTH, -HEIGHT));
 
@@ -100,10 +95,7 @@ async fn main() {
         // --- Camera Pan & Zoom Controls ---
         let (_, wheel_y) = mouse_wheel();
         if wheel_y != 0.0 {
-            // Zoom in or out by 10%
             let zoom_factor = if wheel_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
-            
-            // Adjust the target so we zoom directly towards the mouse cursor
             let mouse_world_before = camera.screen_to_world(current_mouse_pos);
             camera.zoom *= zoom_factor;
             let mouse_world_after = camera.screen_to_world(current_mouse_pos);
@@ -113,7 +105,6 @@ async fn main() {
         if is_mouse_button_down(MouseButton::Middle) {
             let p1 = camera.screen_to_world(last_mouse_pos);
             let p2 = camera.screen_to_world(current_mouse_pos);
-            // Move camera target opposite to mouse movement to drag the world
             camera.target -= p2 - p1;
         }
         last_mouse_pos = current_mouse_pos;
@@ -123,10 +114,10 @@ async fn main() {
             paused = !paused;
         }
         if is_key_pressed(KeyCode::Up) {
-            time_scale = (time_scale * 2.0).min(8.0); // max 8x speed
+            time_scale = (time_scale * 2.0).min(8.0);
         }
         if is_key_pressed(KeyCode::Down) {
-            time_scale = (time_scale * 0.5).max(0.0625); // min 1/16x speed
+            time_scale = (time_scale * 0.5).max(0.0625);
         }
 
         let dt = if paused { 0.0 } else { base_dt * time_scale };
@@ -136,38 +127,15 @@ async fn main() {
         let sim_mouse_x = world_mouse.x / SIM_SCALE;
         let sim_mouse_y = (HEIGHT - world_mouse.y) / SIM_SCALE;
         
-        let interaction_radius = 1.0; 
-        let mut force_strength = 0.0;
+        let interaction_radius = 1.2; 
         
-        if is_mouse_button_down(MouseButton::Left) {
-            force_strength = -50.0;
-        } else if is_mouse_button_down(MouseButton::Right) {
-            force_strength = 50.0;
-        }
-
-        if force_strength != 0.0 && dt > 0.0 {
-            let radius_sq = f32x8::splat(interaction_radius * interaction_radius);
-            let force = f32x8::splat(force_strength * dt);
-            
-            for chunk_index in 0..simulation.num_chunks as usize {
-                let pos = simulation.part_positions[chunk_index];
-                let dx = pos.x - f32x8::splat(sim_mouse_x);
-                let dy = pos.y - f32x8::splat(sim_mouse_y);
-                let dist_sq = dx * dx + dy * dy;
-
-                let mask = dist_sq.cmp_lt(radius_sq);
-                
-                let dist = dist_sq.sqrt() + f32x8::splat(0.0001);
-                let dir_x = dx / dist;
-                let dir_y = dy / dist;
-
-                let dv_x = dir_x * force;
-                let dv_y = dir_y * force;
-
-                let mut vel = simulation.part_velocities[chunk_index];
-                vel.x = mask.blend(vel.x + dv_x, vel.x);
-                vel.y = mask.blend(vel.y + dv_y, vel.y);
-                simulation.part_velocities[chunk_index] = vel;
+        if dt > 0.0 {
+            if is_mouse_button_down(MouseButton::Left) {
+                // Left Click: Push (Positive divergence/expansion)
+                simulation.add_radial_force(sim_mouse_x, sim_mouse_y, interaction_radius, 100.0);
+            } else if is_mouse_button_down(MouseButton::Right) {
+                // Right Click: Pull (Negative divergence/compression)
+                simulation.add_radial_force(sim_mouse_x, sim_mouse_y, interaction_radius, -100.0);
             }
         }
 
@@ -198,7 +166,6 @@ async fn main() {
             let vx_arr = *simulation.part_velocities[chunk_index].x.as_array_ref();
             let vy_arr = *simulation.part_velocities[chunk_index].y.as_array_ref();
             
-            // Mask out unused trailing lanes in the last chunk so they don't corrupt counts
             let is_last_chunk = chunk_index == (simulation.num_chunks as usize - 1);
             let active_lanes = if is_last_chunk && simulation.num_particles % 8 != 0 {
                 simulation.num_particles % 8
@@ -210,7 +177,6 @@ async fn main() {
                 let px_world = x_arr[lane];
                 let py_world = y_arr[lane];
 
-                // Check for NaN
                 if px_world.is_nan() || py_world.is_nan() {
                     nan_count += 1;
                     continue;
@@ -219,7 +185,6 @@ async fn main() {
                 let px = px_world * SIM_SCALE;
                 let py = HEIGHT - (py_world * SIM_SCALE);
                 
-                // Check if vastly out of bounds (which means it glitched past the clamp)
                 if px < -50.0 || px > WIDTH + 50.0 || py < -50.0 || py > HEIGHT + 50.0 {
                     oob_count += 1;
                     continue;
@@ -227,21 +192,18 @@ async fn main() {
 
                 valid_count += 1;
                 
-                // Optimization: Avoid calling expensive `.sqrt()` in the scalar render loop.
                 let speed_sq = vx_arr[lane] * vx_arr[lane] + vy_arr[lane] * vy_arr[lane];
                 let r = (speed_sq * 0.01).min(1.0); 
                 let g = 0.5;
                 let b = 1.0 - r * 0.5;
                 
-                // Draw a colored particle circle.
-                // This utilizes GPU instancing/batching under the hood.
                 draw_texture_ex(
                     &circle_texture,
                     px - DRAW_RADIUS,
                     py - DRAW_RADIUS,
                     Color::new(r, g, b, 1.0),
                     DrawTextureParams {
-                        dest_size: Some(vec2(DRAW_RADIUS * 2.0, DRAW_RADIUS * 2.0)), //
+                        dest_size: Some(vec2(DRAW_RADIUS * 2.0, DRAW_RADIUS * 2.0)),
                         ..Default::default()
                     }
                 );
@@ -285,7 +247,7 @@ async fn main() {
         let debug_color = if nan_count > 0 || oob_count > 0 { Color::new(1.0, 0.0, 0.0, 1.0) } else { Color::new(1.0, 1.0, 0.0, 1.0) };
         draw_text(&debug_text, 10.0, 90.0, 30.0, debug_color);
         
-        let controls_text = "Controls: MMB Drag=Pan | Scroll=Zoom | Up/Down=Speed | Space=Pause | L/R Click=Force";
+        let controls_text = "Controls: MMB Drag=Pan | Scroll=Zoom | Up/Down=Speed | Space=Pause | L/R Click=Force Field";
         draw_text(controls_text, 10.0, 120.0, 20.0, WHITE);
         
         next_frame().await;
