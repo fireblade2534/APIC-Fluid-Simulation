@@ -1,10 +1,10 @@
 use std::mem;
+use rdst::{RadixKey, RadixSort};
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use ultraviolet::{Vec2, Vec2x8};
 use wide::{CmpGt, CmpLt, f32x8, i32x8, u32x8};
 
-const TUNING: f32 = 0.97;
 const SAFTEY: f32 = 1e-20;
 
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
@@ -65,12 +65,83 @@ pub fn bilinear_interpolate(
     return velocity;
 }
 
+#[inline(always)]
+pub fn expand_bits(mut v: u32x8) -> u32x8 {
+    v = v & u32x8::splat(0x0000FFFF);
+    v = (v | (v << 8)) & u32x8::splat(0x00FF00FF);
+    v = (v | (v << 4)) & u32x8::splat(0x0F0F0F0F);
+    v = (v | (v << 2)) & u32x8::splat(0x33333333);
+    v = (v | (v << 1)) & u32x8::splat(0x55555555);
+    v
+}
+
+#[inline(always)]
+pub fn morton_code(x: u32x8, y: u32x8) -> u32x8 {
+    expand_bits(x) | (expand_bits(y) << 1)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SortableTuple {
+    pub key: u32,
+    pub val: u32,
+}
+
+impl SortableTuple {
+    pub fn new(key: u32, val: u32) -> Self {
+        Self {
+            key: key,
+            val: val,
+        }
+    }
+}
+
+impl RadixKey for SortableTuple {
+    const LEVELS: usize = 4;
+
+    #[inline]
+    fn get_level(&self, level: usize) -> u8 {
+        (self.key >> (level * 8)) as u8
+    }
+}
+
+struct LocalGrids {
+    grid_u: Vec<f32>, 
+    grid_v: Vec<f32>, 
+    weight_u: Vec<f32>,
+    weight_v: Vec<f32>,
+    density: Vec<f32>,
+    type_fluid: Vec<u64>,
+}
+
+impl LocalGrids {
+    fn new(apic: &Apic) -> Self {
+        Self {
+            grid_u: vec![0.0; apic.mac_grid_u.len()],
+            weight_u: vec![0.0; apic.mac_weight_u.len()],
+            grid_v: vec![0.0; apic.mac_grid_v.len()],
+            weight_v: vec![0.0; apic.mac_weight_v.len()],
+            density: vec![0.0; apic.mac_density.len()],
+            type_fluid: vec![0; apic.mac_type_fluid.len()],
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in self.grid_u.iter_mut().zip(&other.grid_u) { *a += b; }
+        for (a, b) in self.weight_u.iter_mut().zip(&other.weight_u) { *a += b; }
+        for (a, b) in self.grid_v.iter_mut().zip(&other.grid_v) { *a += b; }
+        for (a, b) in self.weight_v.iter_mut().zip(&other.weight_v) { *a += b; }
+        for (a, b) in self.density.iter_mut().zip(&other.density) { *a += b; }
+        for (a, b) in self.type_fluid.iter_mut().zip(&other.type_fluid) { *a |= b; }
+        
+        return self;
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct WorldProperties {
     pub gravity: f32,
     pub border_damping: f32,
-    pub density: f32
+    pub cfl: f32
 }
 
 #[derive(Default)]
@@ -123,7 +194,7 @@ pub struct Apic {
     pub part_velocities: Vec<Vec2x8>,
     pub part_c_u: Vec<Vec2x8>,
     pub part_c_v: Vec<Vec2x8>,
-    pub part_sort: Vec<(u32, u32)>,
+    pub part_sort: Vec<SortableTuple>,
     pub part_positions_sort: Vec<Vec2x8>,
     pub part_velocities_sort: Vec<Vec2x8>,
     pub part_c_u_sort: Vec<Vec2x8>,
@@ -182,7 +253,7 @@ impl Apic {
         flip.part_c_u_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_c_v_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
-        flip.part_sort.resize((flip.cells / 2) as usize, (0, 0));
+        flip.part_sort.resize((flip.cells / 2) as usize, SortableTuple::new(0, 0));
         flip.num_chunks = flip.cells / 2;
 
         flip.external_force_u.resize((flip.cells + flip.height) as usize, 0.0);
@@ -222,6 +293,15 @@ impl Apic {
 
         flip.part_c_u.resize(flip.num_chunks as usize, Vec2x8::zero());
         flip.part_c_v.resize(flip.num_chunks as usize, Vec2x8::zero());
+
+        flip.part_positions_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
+        flip.part_velocities_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
+        flip.part_c_u_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
+        flip.part_c_v_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
+        let max_dim = flip.width.max(flip.height).next_power_of_two();
+        let lookup_size = (max_dim * max_dim) as usize;
+        flip.part_lookup.resize(lookup_size, (0, 0));
+        flip.part_sort.resize(flip.num_particles as usize, SortableTuple::new(0, 0));
 
         for (i, pos) in initial_positions.iter().enumerate() {
             let chunk_idx = i / 8;
@@ -344,10 +424,17 @@ impl Apic {
     }
 
     pub fn update_spatial_lookup(&mut self) {
+        let max_x = f32x8::splat(self.width.saturating_sub(1) as f32);
+        let max_y = f32x8::splat(self.height.saturating_sub(1) as f32);
+
         for chunk_index in 0..self.num_chunks as usize {
             let positions = self.part_positions[chunk_index];
             let grid_space_positions = positions / f32x8::splat(self.cell_size);
-            let grid_indexes: u32x8 = bytemuck::cast((grid_space_positions.x + (grid_space_positions.y * f32x8::splat(self.width as f32))).max(f32x8::ZERO));
+
+            let grid_x: u32x8 = bytemuck::cast(grid_space_positions.x.max(f32x8::ZERO).min(max_x).fast_trunc_int());
+            let grid_y: u32x8 = bytemuck::cast(grid_space_positions.y.max(f32x8::ZERO).min(max_y).fast_trunc_int());
+
+            let grid_indexes: u32x8 = morton_code(grid_x, grid_y);
 
             let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
                 self.num_particles % 8
@@ -357,15 +444,13 @@ impl Apic {
 
             for lane in 0..active_lanes as usize {
                 let particle_index = (chunk_index * 8) + lane;
-                self.part_sort[particle_index] = (
-                    grid_indexes.as_array_ref()[lane],
-                    particle_index as u32,
-                )
+                self.part_sort[particle_index].key = grid_indexes.as_array_ref()[lane];
+                self.part_sort[particle_index].val = particle_index as u32;
             }
         }
-        
+
         self.part_lookup.fill((u32::MAX, u32::MAX));
-        self.part_sort[..self.num_particles as usize].sort_unstable_by_key(|x| { x.0 } );
+        self.part_sort[..self.num_particles as usize].radix_sort_unstable();
 
         let mut position_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
         let mut velocity_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
@@ -373,7 +458,11 @@ impl Apic {
         let mut c_v_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
 
         let mut previous_hash: u32 = u32::MAX;
-        for (index, &(hash, payload)) in self.part_sort.iter().enumerate() {
+        for (index, tuple) in self.part_sort.iter().enumerate() {
+
+            let hash = tuple.key;
+            let payload = tuple.val;
+
             let buffer_index = index & 7;
 
             let chunk_index = (payload >> 3) as usize;
@@ -406,7 +495,7 @@ impl Apic {
         }
 
         if previous_hash != u32::MAX {
-            self.part_lookup[previous_hash as usize].1 = self.cells;
+            self.part_lookup[previous_hash as usize].1 = self.num_particles;
         }
 
         mem::swap(&mut self.part_positions, &mut self.part_positions_sort);
@@ -1029,12 +1118,12 @@ impl Apic {
                 let precon_x = self.precondition[left_index];
                 let connection_x = self.plus_x_laplacian[left_index] * precon_x;
                 diagonal -= connection_x * connection_x;
-                diagonal -= TUNING * (connection_x * self.plus_y_laplacian[left_index] * precon_x);
+                diagonal -= (connection_x * self.plus_y_laplacian[left_index] * precon_x);
 
                 let precon_y = self.precondition[bottom_index];
-                let connection_y = self.plus_y_laplacian[bottom_index] * precon_y;
+                let connection_y: f32 = self.plus_y_laplacian[bottom_index] * precon_y;
                 diagonal -= connection_y * connection_y;
-                diagonal -= TUNING * (connection_y * self.plus_x_laplacian[bottom_index] * precon_y);
+                diagonal -= (connection_y * self.plus_x_laplacian[bottom_index] * precon_y);
 
                 ap_value += self.plus_x_laplacian[index] * self.mac_pressure_grid[index + 1];
                 ap_value += self.plus_x_laplacian[left_index] * self.mac_pressure_grid[left_index];
@@ -1611,20 +1700,20 @@ impl Apic {
 
     pub fn update(&mut self, frame_deltatime: f32) {
         let mut time_simulated = 0.0;
-
-        let cfl_number = 5.0; 
+ 
     
         while time_simulated < frame_deltatime {
             let max_velocity = self.get_max_particle_velocity();
             
             let max_safe_dt = if max_velocity > 1e-5 {
-                cfl_number * self.cell_size / max_velocity
+                self.world_properties.cfl * self.cell_size / max_velocity
             } else {
                 frame_deltatime
             };
 
             let step_deltatime = max_safe_dt.min(frame_deltatime - time_simulated);
             
+            self.update_spatial_lookup();
             self.transfer_particles_to_grid(step_deltatime, self.timestamp);
             self.apply_external_forces(step_deltatime);
             self.build_pressure_system();

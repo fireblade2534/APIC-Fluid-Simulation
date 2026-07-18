@@ -17,7 +17,7 @@ fn bench_fluid_update(c: &mut Criterion) {
                 let props = WorldProperties {
                     gravity: -9.81,
                     border_damping: 0.1,
-                    density: 1.0,
+                    cfl: 5.0,
                 };
                 
                 // Initialize the fluid simulation

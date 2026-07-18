@@ -7,6 +7,7 @@ edition = "2024"
 bytemuck = "1.25.1"
 macroquad = "0.4.15"
 rayon = "1.12.0"
+rdst = "0.20.14"
 ultraviolet = "0.10.0"
 wide = "0.7.33"
 
