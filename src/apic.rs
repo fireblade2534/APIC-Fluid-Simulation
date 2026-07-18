@@ -117,10 +117,17 @@ pub struct Apic {
     pub precondition: Vec<f32>,
     pub precondition_temp: Vec<f32>,
 
+    pub part_lookup: Vec<(u32, u32)>,
+
     pub part_positions: Vec<Vec2x8>,
     pub part_velocities: Vec<Vec2x8>,
     pub part_c_u: Vec<Vec2x8>,
     pub part_c_v: Vec<Vec2x8>,
+    pub part_sort: Vec<(u32, u32)>,
+    pub part_positions_sort: Vec<Vec2x8>,
+    pub part_velocities_sort: Vec<Vec2x8>,
+    pub part_c_u_sort: Vec<Vec2x8>,
+    pub part_c_v_sort: Vec<Vec2x8>,
 
     pub timestamp: u32,
 }
@@ -170,6 +177,12 @@ impl Apic {
         flip.part_velocities.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_c_u.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_c_v.resize((flip.cells / 2) as usize, Vec2x8::zero());
+        flip.part_positions_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
+        flip.part_velocities_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
+        flip.part_c_u_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
+        flip.part_c_v_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
+        flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
+        flip.part_sort.resize((flip.cells / 2) as usize, (0, 0));
         flip.num_chunks = flip.cells / 2;
 
         flip.external_force_u.resize((flip.cells + flip.height) as usize, 0.0);
@@ -328,6 +341,78 @@ impl Apic {
         let clamped_i: u32x8 = bytemuck::cast(i.min(i32x8::splat((width - 1) as i32)).max(i32x8::ZERO));
         let clamped_j: u32x8 = bytemuck::cast(j.min(i32x8::splat(height as i32)).max(i32x8::ZERO));
         return (clamped_j * u32x8::splat(width as u32)) + clamped_i; 
+    }
+
+    pub fn update_spatial_lookup(&mut self) {
+        for chunk_index in 0..self.num_chunks as usize {
+            let positions = self.part_positions[chunk_index];
+            let grid_space_positions = positions / f32x8::splat(self.cell_size);
+            let grid_indexes: u32x8 = bytemuck::cast((grid_space_positions.x + (grid_space_positions.y * f32x8::splat(self.width as f32))).max(f32x8::ZERO));
+
+            let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
+                self.num_particles % 8
+            } else {
+                8
+            };
+
+            for lane in 0..active_lanes as usize {
+                let particle_index = (chunk_index * 8) + lane;
+                self.part_sort[particle_index] = (
+                    grid_indexes.as_array_ref()[lane],
+                    particle_index as u32,
+                )
+            }
+        }
+        
+        self.part_lookup.fill((u32::MAX, u32::MAX));
+        self.part_sort[..self.num_particles as usize].sort_unstable_by_key(|x| { x.0 } );
+
+        let mut position_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+        let mut velocity_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+        let mut c_u_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+        let mut c_v_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+
+        let mut previous_hash: u32 = u32::MAX;
+        for (index, &(hash, payload)) in self.part_sort.iter().enumerate() {
+            let buffer_index = index & 7;
+
+            let chunk_index = (payload >> 3) as usize;
+            let lane = (payload & 7) as usize; 
+
+            position_buffer[0][buffer_index] = self.part_positions[chunk_index].x.as_array_ref()[lane];
+            position_buffer[1][buffer_index] = self.part_positions[chunk_index].y.as_array_ref()[lane];
+            velocity_buffer[0][buffer_index] = self.part_velocities[chunk_index].x.as_array_ref()[lane];
+            velocity_buffer[1][buffer_index] = self.part_velocities[chunk_index].y.as_array_ref()[lane];
+            c_u_buffer[0][buffer_index] = self.part_c_u[chunk_index].x.as_array_ref()[lane];
+            c_u_buffer[1][buffer_index] = self.part_c_u[chunk_index].y.as_array_ref()[lane];
+            c_v_buffer[0][buffer_index] = self.part_c_v[chunk_index].x.as_array_ref()[lane];
+            c_v_buffer[1][buffer_index] = self.part_c_v[chunk_index].y.as_array_ref()[lane];
+
+            if buffer_index == 7 {
+                self.part_positions_sort[index / 8] = Vec2x8 { x: position_buffer[0].into(), y: position_buffer[1].into() };
+                self.part_velocities_sort[index / 8] = Vec2x8 { x: velocity_buffer[0].into(), y: velocity_buffer[1].into() };
+                self.part_c_u_sort[index / 8] = Vec2x8 { x: c_u_buffer[0].into(), y: c_u_buffer[1].into() };
+                self.part_c_v_sort[index / 8] = Vec2x8 { x: c_v_buffer[0].into(), y: c_v_buffer[1].into() };
+            }
+
+            if previous_hash != hash {
+                if previous_hash != u32::MAX {
+                    self.part_lookup[previous_hash as usize].1 = index as u32;
+                }
+
+                self.part_lookup[hash as usize].0 = index as u32;
+                previous_hash = hash;
+            }
+        }
+
+        if previous_hash != u32::MAX {
+            self.part_lookup[previous_hash as usize].1 = self.cells;
+        }
+
+        mem::swap(&mut self.part_positions, &mut self.part_positions_sort);
+        mem::swap(&mut self.part_velocities, &mut self.part_velocities_sort);
+        mem::swap(&mut self.part_c_u, &mut self.part_c_u_sort);
+        mem::swap(&mut self.part_c_v, &mut self.part_c_v_sort);
     }
 
     #[inline(always)]
