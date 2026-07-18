@@ -14,8 +14,8 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     let mut chunks_b = b.chunks_exact(8);
     
     for (chunk_a, chunk_b) in chunks_a.by_ref().zip(chunks_b.by_ref()) {
-        let va = f32x8::from([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3], chunk_a[4], chunk_a[5], chunk_a[6], chunk_a[7]]);
-        let vb = f32x8::from([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3], chunk_b[4], chunk_b[5], chunk_b[6], chunk_b[7]]);
+        let va = f32x8::from(*<&[f32; 8]>::try_from(chunk_a).unwrap());
+        let vb = f32x8::from(*<&[f32; 8]>::try_from(chunk_b).unwrap());
         sum += va * vb;
     }
     
@@ -74,7 +74,7 @@ pub struct WorldProperties {
 }
 
 #[derive(Default)]
-pub struct Flip {
+pub struct Apic {
     pub world_properties: WorldProperties,
     pub width: u32,
     pub height: u32,
@@ -85,6 +85,8 @@ pub struct Flip {
 
     pub external_force_u: Vec<f32>,
     pub external_force_v: Vec<f32>,
+    pub post_force_u: Vec<f32>,
+    pub post_force_v: Vec<f32>,
 
     pub mac_density: Vec<f32>,
     pub smoothed_density: Vec<f32>,
@@ -119,11 +121,13 @@ pub struct Flip {
     pub part_velocities: Vec<Vec2x8>,
     pub part_c_u: Vec<Vec2x8>,
     pub part_c_v: Vec<Vec2x8>,
+
+    pub timestamp: u32,
 }
 
-impl Flip {
-    pub fn new(width: u32, height: u32, cell_size: f32, world_properties: WorldProperties) -> Flip {
-        let mut flip = Flip::default();
+impl Apic {
+    pub fn new(width: u32, height: u32, cell_size: f32, world_properties: WorldProperties) -> Apic {
+        let mut flip = Apic::default();
 
         flip.world_properties = world_properties;
 
@@ -170,6 +174,8 @@ impl Flip {
 
         flip.external_force_u.resize((flip.cells + flip.height) as usize, 0.0);
         flip.external_force_v.resize((flip.cells + flip.width) as usize, 0.0);
+        flip.post_force_u.resize((flip.cells + flip.height) as usize, 0.0);
+        flip.post_force_v.resize((flip.cells + flip.width) as usize, 0.0);
 
         let mut initial_positions = Vec::new();
         for y in 0..height {
@@ -231,6 +237,36 @@ impl Flip {
         return flip;
     }
 
+    #[inline(always)]
+    pub fn random_simd(&self, chunk_index: usize, seed: u32) -> f32x8 {
+        let base_idx = (chunk_index * 8) as u32;
+        let lanes = u32x8::from([
+            base_idx,
+            base_idx + 1,
+            base_idx + 2,
+            base_idx + 3,
+            base_idx + 4,
+            base_idx + 5,
+            base_idx + 6,
+            base_idx + 7,
+        ]);
+
+        let mut mix = lanes ^ u32x8::splat(seed);
+
+        mix ^= mix >> 16;
+        mix = mix * u32x8::splat(0x7feb352d);
+        mix ^= mix >> 15;
+        mix = mix * u32x8::splat(0x846ca68b);
+        mix ^= mix >> 16;
+
+        let mantissa_mask = u32x8::splat(0x007FFFFF);
+        let exponent_one = u32x8::splat(0x3F800000);
+        let float_bits = (mix & mantissa_mask) | exponent_one;
+
+        let random_number: f32x8 = bytemuck::cast(float_bits);
+
+        return random_number - f32x8::splat(1.5);
+    }
 
     #[inline(always)]
     fn u_index(&self, i: i32, j: i32) -> u32 {
@@ -308,10 +344,10 @@ impl Flip {
         let u_base_x_index = u_base_x.fast_trunc_int();
         let u_base_y_index = u_base_y.fast_trunc_int();
 
-        let u_index_bottom_left = Flip::u_index_simd(width, height, u_base_x_index, u_base_y_index);
-        let u_index_bottom_right = Flip::u_index_simd(width, height, u_base_x_index + 1, u_base_y_index);
-        let u_index_top_left = Flip::u_index_simd(width, height, u_base_x_index, u_base_y_index + 1);
-        let u_index_top_right = Flip::u_index_simd(width, height, u_base_x_index + 1, u_base_y_index + 1);
+        let u_index_bottom_left = Apic::u_index_simd(width, height, u_base_x_index, u_base_y_index);
+        let u_index_bottom_right = Apic::u_index_simd(width, height, u_base_x_index + 1, u_base_y_index);
+        let u_index_top_left = Apic::u_index_simd(width, height, u_base_x_index, u_base_y_index + 1);
+        let u_index_top_right = Apic::u_index_simd(width, height, u_base_x_index + 1, u_base_y_index + 1);
 
         let u_tx = u_grid_x - u_base_x;
         let u_ty = u_grid_y - u_base_y;
@@ -357,11 +393,10 @@ impl Flip {
         let v_base_x_index = v_base_x.fast_trunc_int();
         let v_base_y_index = v_base_y.fast_trunc_int();
 
-        // Call our static functions via Flip::
-        let v_index_bottom_left = Flip::v_index_simd(width, height, v_base_x_index, v_base_y_index);
-        let v_index_bottom_right = Flip::v_index_simd(width, height, v_base_x_index + 1, v_base_y_index);
-        let v_index_top_left = Flip::v_index_simd(width, height, v_base_x_index, v_base_y_index + 1);
-        let v_index_top_right = Flip::v_index_simd(width, height, v_base_x_index + 1, v_base_y_index + 1);
+        let v_index_bottom_left = Apic::v_index_simd(width, height, v_base_x_index, v_base_y_index);
+        let v_index_bottom_right = Apic::v_index_simd(width, height, v_base_x_index + 1, v_base_y_index);
+        let v_index_top_left = Apic::v_index_simd(width, height, v_base_x_index, v_base_y_index + 1);
+        let v_index_top_right = Apic::v_index_simd(width, height, v_base_x_index + 1, v_base_y_index + 1);
 
         return (
             v_weight_bottom_left,
@@ -394,7 +429,7 @@ impl Flip {
         );
     }
 
-    pub fn transfer_particles_to_grid(&mut self) {
+    pub fn transfer_particles_to_grid(&mut self, deltatime: f32, timestamp: u32) {
         self.mac_grid_u.fill(0.0);
         self.mac_grid_v.fill(0.0);
         self.mac_weight_u.fill(0.0);
@@ -407,19 +442,32 @@ impl Flip {
         self.mac_density.fill(0.0);
 
         for chunk_index in 0..self.num_chunks as usize {
-            let positions = self.part_positions[chunk_index];
+            let raw_positions = self.part_positions[chunk_index];
             let velocities = self.part_velocities[chunk_index];
+
+            let temporal_jitter = self.random_simd(chunk_index, timestamp) * f32x8::splat(deltatime);
+            let seed_x = timestamp.wrapping_mul(73856093) ^ 0x193a6754;
+            let seed_y = timestamp.wrapping_mul(19349663) ^ 0x45678912;
+
+            let max_spatial_jitter = f32x8::splat(self.cell_size);
+            let spatial_jitter_x = self.random_simd(chunk_index, seed_x) * max_spatial_jitter;
+            let spatial_jitter_y = self.random_simd(chunk_index, seed_y) * max_spatial_jitter;
+
+            let mut positions = raw_positions + (velocities * temporal_jitter);
+            positions.x += spatial_jitter_x;
+            positions.y += spatial_jitter_y;
 
             let c_u = self.part_c_u[chunk_index];
             let c_v = self.part_c_v[chunk_index];
 
             let grid_space_positions = positions / f32x8::splat(self.cell_size);
+            let true_grid_space_positions = raw_positions / f32x8::splat(self.cell_size); 
 
             let half = f32x8::splat(0.5);
             let one = f32x8::splat(1.0);
             
-            let c_grid_x = grid_space_positions.x - half;
-            let c_grid_y = grid_space_positions.y - half;
+            let c_grid_x = true_grid_space_positions.x - half;
+            let c_grid_y = true_grid_space_positions.y - half;
             
             let c_base_x = c_grid_x.floor();
             let c_base_y = c_grid_y.floor();
@@ -454,9 +502,14 @@ impl Flip {
                 u_index_bottom_right,
                 u_index_top_left,
                 u_index_top_right,
-                u_tx,
-                u_ty,
-            ) = Flip::get_u_grid(self.width, self.height, grid_space_positions);
+                _u_tx,
+                _u_ty,
+            ) = Apic::get_u_grid(self.width, self.height, grid_space_positions);
+
+            let u_base_x = grid_space_positions.x.floor();
+            let u_base_y = (grid_space_positions.y - half).floor();
+            let true_u_tx = true_grid_space_positions.x - u_base_x;
+            let true_u_ty = (true_grid_space_positions.y - half) - u_base_y;
 
             let (
                 u_diff_bottom_left_x,
@@ -467,7 +520,7 @@ impl Flip {
                 u_diff_top_left_y,
                 u_diff_top_right_x,
                 u_diff_top_right_y
-            ) = Flip::get_grid_distances(self.cell_size, u_tx, u_ty);
+            ) = Apic::get_grid_distances(self.cell_size, true_u_tx, true_u_ty);
             
             // V GRID
             let (
@@ -479,9 +532,14 @@ impl Flip {
                 v_index_bottom_right,
                 v_index_top_left,
                 v_index_top_right,
-                v_tx,
-                v_ty,
-            ) = Flip::get_v_grid(self.width, self.height, grid_space_positions);
+                _v_tx,
+                _v_ty,
+            ) = Apic::get_v_grid(self.width, self.height, grid_space_positions);
+
+            let v_base_x = (grid_space_positions.x - half).floor();
+            let v_base_y = grid_space_positions.y.floor();
+            let true_v_tx = (true_grid_space_positions.x - half) - v_base_x;
+            let true_v_ty = true_grid_space_positions.y - v_base_y;
 
             let (
                 v_diff_bottom_left_x,
@@ -492,7 +550,7 @@ impl Flip {
                 v_diff_top_left_y,
                 v_diff_top_right_x,
                 v_diff_top_right_y
-            ) = Flip::get_grid_distances(self.cell_size, v_tx, v_ty);
+            ) = Apic::get_grid_distances(self.cell_size, true_v_tx, true_v_ty);
 
 
             
@@ -644,6 +702,17 @@ impl Flip {
         }
     }
 
+    #[inline(always)]
+    pub fn calculate_theta(&self, rho: f32, rho_center: f32, target_density: f32) -> f32 {
+        let threshold = target_density * 0.5;
+        let diff = rho_center - rho;
+        
+        if diff.abs() <= 1e-5 { 
+            return 1.0; 
+        }
+        
+        ((rho_center - threshold) / diff).clamp(0.1, 1.0)
+    }
 
     pub fn build_pressure_system(&mut self) {
         self.diag_laplacian.fill(0.0);
@@ -703,19 +772,65 @@ impl Flip {
 
                 let divergence = (u_right - u_left) + (v_top - v_bottom);
                 
-                let fluid_right = self.is_fluid(grid_x as i32 + 1, grid_y as i32);
-                let fluid_top = self.is_fluid(grid_x as i32, grid_y as i32 + 1);
-
                 let target_density = 9.0; 
-                let density_excess = (self.smoothed_density[fluid_index] - target_density).max(0.0).min(target_density);
+                let rho_center = self.smoothed_density[fluid_index];
+
+                let noise_threshold = target_density * 1.15; 
+                let density_excess = (rho_center - noise_threshold).max(0.0).min(target_density);
                 let correction_rate = 0.1;
 
                 self.current_error[fluid_index] = -divergence * self.cell_size 
                     + density_excess * correction_rate * self.cell_size * self.cell_size;
 
-                self.diag_laplacian[fluid_index] += (non_obstacle_left + non_obstacle_right + non_obstacle_bottom + non_obstacle_top) as f32;
-                self.plus_x_laplacian[fluid_index] = -(fluid_right as f32);
-                self.plus_y_laplacian[fluid_index] = -(fluid_top as f32);
+                let fluid_left = self.is_fluid(grid_x as i32 - 1, grid_y as i32);
+                let fluid_right = self.is_fluid(grid_x as i32 + 1, grid_y as i32);
+                let fluid_bottom = self.is_fluid(grid_x as i32, grid_y as i32 - 1);
+                let fluid_top = self.is_fluid(grid_x as i32, grid_y as i32 + 1);
+
+                let mut diag = 0.0;
+                let width = self.width as usize;
+
+                if non_obstacle_left == 1 {
+                    if fluid_left == 1 { 
+                        diag += 1.0;
+                    } else {
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index - 1], rho_center, target_density);
+                    }
+                }
+                
+                if non_obstacle_right == 1 {
+                    if fluid_right == 1 { 
+                        diag += 1.0; 
+                        self.plus_x_laplacian[fluid_index] = -1.0; 
+                    } else { 
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index + 1], rho_center, target_density); 
+                        self.plus_x_laplacian[fluid_index] = 0.0; 
+                    }
+                } else {
+                    self.plus_x_laplacian[fluid_index] = 0.0;
+                }
+
+                if non_obstacle_bottom == 1 {
+                    if fluid_bottom == 1 { 
+                        diag += 1.0;
+                    } else {
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index - width], rho_center, target_density);
+                    }
+                }
+
+                if non_obstacle_top == 1 {
+                    if fluid_top == 1 { 
+                        diag += 1.0; 
+                        self.plus_y_laplacian[fluid_index] = -1.0; 
+                    } else { 
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index + width], rho_center, target_density); 
+                        self.plus_y_laplacian[fluid_index] = 0.0; 
+                    }
+                } else {
+                    self.plus_y_laplacian[fluid_index] = 0.0;
+                }
+
+                self.diag_laplacian[fluid_index] = diag;
 
                 fluid_mask &= fluid_mask - 1;
             }
@@ -793,9 +908,17 @@ impl Flip {
     pub fn solve_pcg(&mut self) {
         self.precondition.fill(0.0);
 
-        for index in 0..self.cells as usize {
-            if self.is_fluid_index(index) == 0 {
-                self.mac_pressure_grid[index] = 0.0;
+        unsafe {
+            for fluid_mask_index in 0..self.mac_type_fluid.len() {
+                let mut fluid_mask: u64 = *self.mac_type_fluid.get_unchecked(fluid_mask_index);
+
+                while fluid_mask != 0 {
+                    let fluid_index = (fluid_mask_index * 64) + (fluid_mask.trailing_zeros() as usize);
+
+                    *self.mac_pressure_grid.get_unchecked_mut(fluid_index) = 0.0;
+
+                    fluid_mask &= fluid_mask - 1;
+                }
             }
         }
 
@@ -949,24 +1072,29 @@ impl Flip {
 
                 if left_is_obstacle != right_is_obstacle {
                     self.mac_grid_u[face_index] = 0.0;
+                    self.mac_valid_u[face_index] = true;
                     continue;
                 }
 
-                let left_pressure = if self.is_fluid(left_cell_x, y) == 1 {
-                    let left_cell_index = ((y * self.width as i32) + left_cell_x) as usize;
-                    self.mac_pressure_grid[left_cell_index]
-                } else {
-                    0.0
-                };
+                let left_is_fluid = self.is_fluid(left_cell_x, y) == 1;
+                let right_is_fluid = self.is_fluid(x, y) == 1;
+                
+                let target_density = 9.0;
+                let mut pressure_difference = 0.0;
+                
+                let left_cell_index = ((y * self.width as i32) + left_cell_x) as usize;
+                let right_cell_index = ((y * self.width as i32) + x) as usize;
 
-                let right_pressure = if self.is_fluid(x, y) == 1 {
-                    let right_cell_index = ((y * self.width as i32) + x) as usize;
-                    self.mac_pressure_grid[right_cell_index]
-                } else {
-                    0.0
-                };
+                if left_is_fluid && right_is_fluid {
+                    pressure_difference = self.mac_pressure_grid[right_cell_index] - self.mac_pressure_grid[left_cell_index];
+                } else if left_is_fluid {
+                    let theta = self.calculate_theta(self.smoothed_density[right_cell_index], self.smoothed_density[left_cell_index], target_density);
+                    pressure_difference = -self.mac_pressure_grid[left_cell_index] / theta;
+                } else if right_is_fluid {
+                    let theta = self.calculate_theta(self.smoothed_density[left_cell_index], self.smoothed_density[right_cell_index], target_density);
+                    pressure_difference = self.mac_pressure_grid[right_cell_index] / theta;
+                }
 
-                let pressure_difference = right_pressure - left_pressure;
                 self.mac_grid_u[face_index] -= pressure_difference / self.cell_size;
 
             }
@@ -984,24 +1112,29 @@ impl Flip {
 
                 if bottom_is_obstacle != top_is_obstacle {
                     self.mac_grid_v[face_index] = 0.0;
+                    self.mac_valid_v[face_index] = true;
                     continue;
                 }
 
-                let bottom_pressure = if self.is_fluid(x, bottom_cell_y) == 1 {
-                    let bottom_cell_index = ((bottom_cell_y * self.width as i32) + x) as usize;
-                    self.mac_pressure_grid[bottom_cell_index]
-                } else {
-                    0.0
-                };
+                let bottom_is_fluid = self.is_fluid(x, bottom_cell_y) == 1;
+                let top_is_fluid = self.is_fluid(x, y) == 1;
+                
+                let target_density = 9.0;
+                let mut pressure_difference = 0.0;
+                
+                let bottom_cell_index = ((bottom_cell_y * self.width as i32) + x) as usize;
+                let top_cell_index = ((y * self.width as i32) + x) as usize;
 
-                let top_pressure = if self.is_fluid(x, y) == 1 {
-                    let top_cell_index = ((y * self.width as i32) + x) as usize;
-                    self.mac_pressure_grid[top_cell_index]
-                } else {
-                    0.0
-                };
+                if bottom_is_fluid && top_is_fluid {
+                    pressure_difference = self.mac_pressure_grid[top_cell_index] - self.mac_pressure_grid[bottom_cell_index];
+                } else if bottom_is_fluid {
+                    let theta = self.calculate_theta(self.smoothed_density[top_cell_index], self.smoothed_density[bottom_cell_index], target_density);
+                    pressure_difference = -self.mac_pressure_grid[bottom_cell_index] / theta;
+                } else if top_is_fluid {
+                    let theta = self.calculate_theta(self.smoothed_density[bottom_cell_index], self.smoothed_density[top_cell_index], target_density);
+                    pressure_difference = self.mac_pressure_grid[top_cell_index] / theta;
+                }
 
-                let pressure_difference = top_pressure - bottom_pressure;
                 self.mac_grid_v[face_index] -= pressure_difference / self.cell_size;
             }
         }
@@ -1041,7 +1174,7 @@ impl Flip {
                 u_index_top_right,
                 u_tx,
                 u_ty,
-            ) = Flip::get_u_grid(width, height, grid_space_positions);
+            ) = Apic::get_u_grid(width, height, grid_space_positions);
 
             let (
                 u_diff_bottom_left_x,
@@ -1052,7 +1185,7 @@ impl Flip {
                 u_diff_top_left_y,
                 u_diff_top_right_x,
                 u_diff_top_right_y
-            ) = Flip::get_grid_distances(cell_size, u_tx, u_ty);
+            ) = Apic::get_grid_distances(cell_size, u_tx, u_ty);
             
             // V GRID
             let (
@@ -1066,7 +1199,7 @@ impl Flip {
                 v_index_top_right,
                 v_tx,
                 v_ty,
-            ) = Flip::get_v_grid(width, height, grid_space_positions);
+            ) = Apic::get_v_grid(width, height, grid_space_positions);
 
             let (
                 v_diff_bottom_left_x,
@@ -1077,7 +1210,7 @@ impl Flip {
                 v_diff_top_left_y,
                 v_diff_top_right_x,
                 v_diff_top_right_y
-            ) = Flip::get_grid_distances(cell_size, v_tx, v_ty);
+            ) = Apic::get_grid_distances(cell_size, v_tx, v_ty);
 
             let u_node_bl = gather_f32x8(&self.mac_grid_u, u_index_bottom_left);
             let u_node_br = gather_f32x8(&self.mac_grid_u, u_index_bottom_right);
@@ -1233,7 +1366,7 @@ impl Flip {
 
                         if count > 0 {
                             self.mac_grid_u[index] = sum / (count as f32);
-                            self.next_valid_u[index] = true;
+                            self.mac_valid_u[index] = true;
                         } else {
                             self.mac_grid_u[index] = self.old_grid_u[index];
                             self.mac_valid_u[index] = false;
@@ -1321,9 +1454,11 @@ impl Flip {
         let max_y = (((world_y + radius) / self.cell_size).ceil() as i32).min(self.height as i32) as u32;
 
         let radius_sq = radius * radius;
+        let is_repel = strength > 0.0; // Route positive pushing to post_force
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
+                // U Grid faces
                 if x <= self.width && y < self.height {
                     let u_world_x = (x as f32) * self.cell_size;
                     let u_world_y = (y as f32 + 0.5) * self.cell_size;
@@ -1336,9 +1471,17 @@ impl Flip {
                         let falloff = 1.0 - (dist / radius);
                         let dir_x = dx / dist;
                         let u_idx = self.u_index(x as i32, y as i32) as usize;
-                        self.external_force_u[u_idx] += dir_x * strength * falloff;
+                        let force = dir_x * strength * falloff;
+                        
+                        if is_repel {
+                            self.post_force_u[u_idx] += force;
+                        } else {
+                            self.external_force_u[u_idx] += force;
+                        }
                     }
                 }
+
+                // V Grid faces
                 if x < self.width && y <= self.height {
                     let v_world_x = (x as f32 + 0.5) * self.cell_size;
                     let v_world_y = (y as f32) * self.cell_size;
@@ -1351,36 +1494,14 @@ impl Flip {
                         let falloff = 1.0 - (dist / radius);
                         let dir_y = dy / dist;
                         let v_idx = self.v_index(x as i32, y as i32) as usize;
-                        self.external_force_v[v_idx] += dir_y * strength * falloff;
+                        let force = dir_y * strength * falloff;
+                        
+                        if is_repel {
+                            self.post_force_v[v_idx] += force;
+                        } else {
+                            self.external_force_v[v_idx] += force;
+                        }
                     }
-                }
-            }
-        }
-    }
-
-    pub fn add_directional_force(&mut self, world_x: f32, world_y: f32, radius: f32, force_x: f32, force_y: f32) {
-        let min_x = (((world_x - radius) / self.cell_size).floor() as i32).max(0) as u32;
-        let max_x = (((world_x + radius) / self.cell_size).ceil() as i32).min(self.width as i32 - 1) as u32;
-        let min_y = (((world_y - radius) / self.cell_size).floor() as i32).max(0) as u32;
-        let max_y = (((world_y + radius) / self.cell_size).ceil() as i32).min(self.height as i32 - 1) as u32;
-
-        let radius_sq = radius * radius;
-
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let cell_x = (x as f32 + 0.5) * self.cell_size;
-                let cell_y = (y as f32 + 0.5) * self.cell_size;
-                let dx = cell_x - world_x;
-                let dy = cell_y - world_y;
-                let dist_sq = dx * dx + dy * dy;
-
-                if dist_sq < radius_sq {
-                    let falloff = 1.0 - (dist_sq / radius_sq);
-                    let u_idx = self.u_index(x as i32, y as i32) as usize;
-                    let v_idx = self.v_index(x as i32, y as i32) as usize;
-                    
-                    self.external_force_u[u_idx] += force_x * falloff;
-                    self.external_force_v[v_idx] += force_y * falloff;
                 }
             }
         }
@@ -1406,7 +1527,7 @@ impl Flip {
     pub fn update(&mut self, frame_deltatime: f32) {
         let mut time_simulated = 0.0;
 
-        let cfl_number = 1.0; 
+        let cfl_number = 5.0; 
     
         while time_simulated < frame_deltatime {
             let max_velocity = self.get_max_particle_velocity();
@@ -1419,18 +1540,30 @@ impl Flip {
 
             let step_deltatime = max_safe_dt.min(frame_deltatime - time_simulated);
             
-            self.transfer_particles_to_grid();
+            self.transfer_particles_to_grid(step_deltatime, self.timestamp);
             self.apply_external_forces(step_deltatime);
             self.build_pressure_system();
             self.solve_pcg();
             self.apply_pressure_gradient();
+
+            for i in 0..self.mac_grid_u.len() {
+                self.mac_grid_u[i] += self.post_force_u[i] * step_deltatime;
+            }
+            for i in 0..self.mac_grid_v.len() {
+                self.mac_grid_v[i] += self.post_force_v[i] * step_deltatime;
+            }
+
             self.extrapolate_velocity();
             self.transfer_grid_to_particles_and_advect(step_deltatime);
             
             time_simulated += step_deltatime;
+
+            self.timestamp += 1;
         }
 
         self.external_force_u.fill(0.0);
         self.external_force_v.fill(0.0);
+        self.post_force_u.fill(0.0);
+        self.post_force_v.fill(0.0);
     }
 }

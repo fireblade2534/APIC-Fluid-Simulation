@@ -1,4 +1,4 @@
-use FLIP::flip::{Flip, WorldProperties};
+use FLIP::apic::{Apic, WorldProperties};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 
@@ -21,7 +21,7 @@ fn bench_fluid_update(c: &mut Criterion) {
                 };
                 
                 // Initialize the fluid simulation
-                let mut flip = Flip::new(size, size, 1.0, props);
+                let mut flip = Apic::new(size, size, 1.0, props);
 
                 // WARMUP: 
                 // A fluid sim at rest (frame 0) solves almost instantly because velocities 

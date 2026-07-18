@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-mod flip;
-use flip::{Flip, WorldProperties};
+mod apic;
+use apic::{Apic, WorldProperties};
 use macroquad::{
     camera::{set_camera, set_default_camera, Camera2D},
     color::{Color, BLACK, WHITE},
@@ -41,7 +41,7 @@ async fn main() {
         density: 1000.0
     };
 
-    let mut simulation = Flip::new(
+    let mut simulation = Apic::new(
         GRID_WIDTH,
         GRID_HEIGHT,
         CELL_SIZE,
@@ -132,10 +132,10 @@ async fn main() {
         if dt > 0.0 {
             if is_mouse_button_down(MouseButton::Left) {
                 // Left Click: Push (Positive divergence/expansion)
-                simulation.add_radial_force(sim_mouse_x, sim_mouse_y, interaction_radius, 100.0);
+                simulation.add_radial_force(sim_mouse_x, sim_mouse_y, interaction_radius, 150.0);
             } else if is_mouse_button_down(MouseButton::Right) {
                 // Right Click: Pull (Negative divergence/compression)
-                simulation.add_radial_force(sim_mouse_x, sim_mouse_y, interaction_radius, -100.0);
+                simulation.add_radial_force(sim_mouse_x, sim_mouse_y, interaction_radius, -150.0);
             }
         }
 
