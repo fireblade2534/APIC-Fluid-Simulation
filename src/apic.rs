@@ -104,38 +104,6 @@ impl RadixKey for SortableTuple {
     }
 }
 
-struct LocalGrids {
-    grid_u: Vec<f32>, 
-    grid_v: Vec<f32>, 
-    weight_u: Vec<f32>,
-    weight_v: Vec<f32>,
-    density: Vec<f32>,
-    type_fluid: Vec<u64>,
-}
-
-impl LocalGrids {
-    fn new(apic: &Apic) -> Self {
-        Self {
-            grid_u: vec![0.0; apic.mac_grid_u.len()],
-            weight_u: vec![0.0; apic.mac_weight_u.len()],
-            grid_v: vec![0.0; apic.mac_grid_v.len()],
-            weight_v: vec![0.0; apic.mac_weight_v.len()],
-            density: vec![0.0; apic.mac_density.len()],
-            type_fluid: vec![0; apic.mac_type_fluid.len()],
-        }
-    }
-
-    fn merge(mut self, other: Self) -> Self {
-        for (a, b) in self.grid_u.iter_mut().zip(&other.grid_u) { *a += b; }
-        for (a, b) in self.weight_u.iter_mut().zip(&other.weight_u) { *a += b; }
-        for (a, b) in self.grid_v.iter_mut().zip(&other.grid_v) { *a += b; }
-        for (a, b) in self.weight_v.iter_mut().zip(&other.weight_v) { *a += b; }
-        for (a, b) in self.density.iter_mut().zip(&other.density) { *a += b; }
-        for (a, b) in self.type_fluid.iter_mut().zip(&other.type_fluid) { *a |= b; }
-        
-        return self;
-    }
-}
 
 #[derive(Default, Clone)]
 pub struct WorldProperties {
@@ -1111,7 +1079,6 @@ impl Apic {
                 let mut connection_x: f32 = 0.0;
                 let mut connection_y: f32 = 0.0;
 
-
                 let left_index = index - 1;
                 let bottom_index = index - self.width as usize;
 
@@ -1487,136 +1454,82 @@ impl Apic {
     }
 
     pub fn extrapolate_velocity(&mut self) {
-        std::mem::swap(&mut self.mac_grid_u, &mut self.old_grid_u);
-        std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
-
         let width = self.width as usize;
         let height = self.height as usize;
 
-        for iter in 0..4 {
-            for y in 0..height {
-                for x in 0..=width {
-                    let index = y * (width + 1) + x;
+        for _ in 0..4 {
+            std::mem::swap(&mut self.mac_grid_u, &mut self.old_grid_u);
+            std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
 
-                    if self.next_valid_u[index] {
-                        self.mac_grid_u[index] = self.old_grid_u[index];
-                        self.mac_valid_u[index] = true;
+            let old_grid_u = &self.old_grid_u;
+            let next_valid_u = &self.next_valid_u;
+
+            self.mac_grid_u.par_iter_mut()
+                .zip(self.mac_valid_u.par_iter_mut())
+                .enumerate()
+                .with_min_len(512)
+                .for_each(|(index, (u, valid))| {
+                if next_valid_u[index] {
+                    *u = old_grid_u[index];
+                    *valid = true;
+                } else {
+                    let mut sum: f32 = 0.0;
+                    let mut count: u32 = 0;
+                    let x = index % (width + 1);
+                    let y = index / (width + 1);
+
+                    if x > 0 && next_valid_u[index - 1] { sum += old_grid_u[index - 1]; count += 1; }
+                    if x < width && next_valid_u[index + 1] { sum += old_grid_u[index + 1]; count += 1; }
+                    if y > 0 && next_valid_u[index - (width + 1)] { sum += old_grid_u[index - (width + 1)]; count += 1; }
+                    if y < height - 1 && next_valid_u[index + width + 1] { sum += old_grid_u[index + width + 1]; count += 1; }
+
+                    if count > 0 {
+                        *u = sum / (count as f32);
+                        *valid = true;
                     } else {
-                        let mut sum: f32 = 0.0;
-                        let mut count: u32 = 0;
-
-                        if x > 0 {
-                            let new_index = index - 1;
-                            if self.next_valid_u[new_index] {
-                                sum += self.old_grid_u[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if x < width {
-                            let new_index = index + 1;
-                            if self.next_valid_u[new_index] {
-                                sum += self.old_grid_u[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if y > 0 {
-                            let new_index = index - (width + 1);
-                            if self.next_valid_u[new_index] {
-                                sum += self.old_grid_u[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if y < height - 1 {
-                            let new_index = index + width + 1;
-                            if self.next_valid_u[new_index] {
-                                sum += self.old_grid_u[new_index];
-                                count += 1;
-                            }
-                        }
-
-
-                        if count > 0 {
-                            self.mac_grid_u[index] = sum / (count as f32);
-                            self.mac_valid_u[index] = true;
-                        } else {
-                            self.mac_grid_u[index] = self.old_grid_u[index];
-                            self.mac_valid_u[index] = false;
-                        }
+                        *u = old_grid_u[index];
+                        *valid = false;
                     }
                 }
-            }
-            
-            if iter < 3 {
-                std::mem::swap(&mut self.mac_grid_u, &mut self.old_grid_u);
-                std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
-            }
+            });
         }
             
-        std::mem::swap(&mut self.mac_grid_v, &mut self.old_grid_v);
-        std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
+            
+        for _ in 0..4 {
+            std::mem::swap(&mut self.mac_grid_v, &mut self.old_grid_v);
+            std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
 
-        for iter in 0..4 {
-            for y in 0..=height {
-                for x in 0..width {
-                    let index = y * width + x;
+            let old_grid_v = &self.old_grid_v;
+            let next_valid_v = &self.next_valid_v;
 
-                    if self.next_valid_v[index] {
-                        self.mac_grid_v[index] = self.old_grid_v[index];
-                        self.mac_valid_v[index] = true;
+            self.mac_grid_v.par_iter_mut()
+                .zip(self.mac_valid_v.par_iter_mut())
+                .enumerate()
+                .with_min_len(512)
+                .for_each(|(index, (v, valid))| {
+                if next_valid_v[index] {
+                    *v = old_grid_v[index];
+                    *valid = true;
+                } else {
+                    let mut sum: f32 = 0.0;
+                    let mut count: u32 = 0;
+                    let x = index % width;
+                    let y = index / width;
+
+                    if x > 0 && next_valid_v[index - 1] { sum += old_grid_v[index - 1]; count += 1; }
+                    if x < width - 1 && next_valid_v[index + 1] { sum += old_grid_v[index + 1]; count += 1; }
+                    if y > 0 && next_valid_v[index - width] { sum += old_grid_v[index - width]; count += 1; }
+                    if y < height && next_valid_v[index + width] { sum += old_grid_v[index + width]; count += 1; }
+
+                    if count > 0 {
+                        *v = sum / (count as f32);
+                        *valid = true;
                     } else {
-                        let mut sum: f32 = 0.0;
-                        let mut count: u32 = 0;
-
-                        if x > 0 {
-                            let new_index = index - 1;
-                            if self.next_valid_v[new_index] {
-                                sum += self.old_grid_v[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if x < width - 1 {
-                            let new_index = index + 1;
-                            if self.next_valid_v[new_index] {
-                                sum += self.old_grid_v[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if y > 0 {
-                            let new_index = index - width;
-                            if self.next_valid_v[new_index] {
-                                sum += self.old_grid_v[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if y < height {
-                            let new_index = index + width;
-                            if self.next_valid_v[new_index] {
-                                sum += self.old_grid_v[new_index];
-                                count += 1;
-                            }
-                        }
-
-                        if count > 0 {
-                            self.mac_grid_v[index] = sum / (count as f32);
-                            self.mac_valid_v[index] = true;
-                        } else {
-                            self.mac_grid_v[index] = self.old_grid_v[index];
-                            self.mac_valid_v[index] = false;
-                        }
+                        *v = old_grid_v[index];
+                        *valid = false;
                     }
                 }
-            }
-
-            if iter < 3 {
-                std::mem::swap(&mut self.mac_grid_v, &mut self.old_grid_v);
-                std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
-            }
+            });
         }
 
     }
