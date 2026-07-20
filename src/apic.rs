@@ -29,7 +29,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline(always)]
 pub fn gather_f32x8(slice: &[f32], indices: u32x8) -> f32x8 {
-    let indexes: [u32; 8] = indices.to_array();
+    let indexes = indices.as_array_ref();
     unsafe {
         return f32x8::from([
             *slice.get_unchecked(*indexes.get_unchecked(0) as usize),
@@ -40,6 +40,38 @@ pub fn gather_f32x8(slice: &[f32], indices: u32x8) -> f32x8 {
             *slice.get_unchecked(*indexes.get_unchecked(5) as usize),
             *slice.get_unchecked(*indexes.get_unchecked(6) as usize),
             *slice.get_unchecked(*indexes.get_unchecked(7) as usize),
+        ]);
+    }
+}
+
+#[inline(always)]
+pub fn scatter_f32x8(slice: &mut [f32], values: f32x8, indices: u32x8) {
+    let indexes_8= indices.as_array_ref();
+    let values_8= values.as_array_ref();
+    unsafe {
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(0) as usize) = *values_8.get_unchecked(0);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(1) as usize) = *values_8.get_unchecked(1);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(2) as usize) = *values_8.get_unchecked(2);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(3) as usize) = *values_8.get_unchecked(3);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(4) as usize) = *values_8.get_unchecked(4);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(5) as usize) = *values_8.get_unchecked(5);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(6) as usize) = *values_8.get_unchecked(6);
+        *slice.get_unchecked_mut(*indexes_8.get_unchecked(7) as usize) = *values_8.get_unchecked(7);
+    }
+}
+
+pub fn reverse_u32x8(values: u32x8) -> u32x8 {
+    let values_8 = values.to_array();
+    unsafe {
+        return u32x8::from([
+            *values_8.get_unchecked(7),
+            *values_8.get_unchecked(6),
+            *values_8.get_unchecked(5),
+            *values_8.get_unchecked(4),
+            *values_8.get_unchecked(3),
+            *values_8.get_unchecked(2),
+            *values_8.get_unchecked(1),
+            *values_8.get_unchecked(0),
         ]);
     }
 }
@@ -170,6 +202,8 @@ pub struct Apic {
     pub part_c_u_sort: Vec<Vec2x8>,
     pub part_c_v_sort: Vec<Vec2x8>,
 
+    pub fluid_cells: u32,
+
     pub timestamp: u32,
 }
 
@@ -185,7 +219,7 @@ impl Apic {
 
         flip.cells = width * height;
 
-        flip.mac_pressure_grid.resize(flip.cells as usize, 0.0);
+        flip.mac_pressure_grid.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.mac_grid_u.resize((flip.cells + flip.height) as usize, 0.0);
         flip.mac_grid_v.resize((flip.cells + flip.width) as usize, 0.0);
         flip.mac_weight_u.resize((flip.cells + flip.height) as usize, 0.0); 
@@ -194,26 +228,26 @@ impl Apic {
         flip.mac_valid_v.resize((flip.cells + flip.width) as usize, false);
         flip.mac_type_obstacle.resize(flip.cells.div_ceil(64) as usize, 0);
         flip.mac_type_fluid.resize(flip.cells.div_ceil(64) as usize, 0);
-        flip.mac_fluid_index.resize(flip.cells as usize, 0);
+        flip.mac_fluid_index.resize((flip.cells.div_ceil(8) * 8) as usize, 0);
 
         flip.old_grid_u.resize((flip.cells + flip.height) as usize, 0.0);
         flip.old_grid_v.resize((flip.cells + flip.width) as usize, 0.0);
         flip.next_valid_u.resize((flip.cells + flip.height) as usize, false);
         flip.next_valid_v.resize((flip.cells + flip.width) as usize, false);
 
-        flip.mac_density.resize(flip.cells as usize, 0.0);
-        flip.smoothed_density.resize(flip.cells as usize, 0.0);
-        flip.old_density.resize(flip.cells as usize, 0.0);
+        flip.mac_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.smoothed_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.old_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
 
-        flip.smoothed_error.resize(flip.cells as usize, 0.0);
-        flip.current_error.resize(flip.cells as usize, 0.0);
-        flip.search_vector.resize(flip.cells as usize, 0.0);
-        flip.matrix_times_search.resize(flip.cells as usize, 0.0);
-        flip.diag_laplacian.resize(flip.cells as usize, 0.0);
-        flip.plus_x_laplacian.resize(flip.cells as usize, 0.0);
-        flip.plus_y_laplacian.resize(flip.cells as usize, 0.0);
-        flip.precondition.resize(flip.cells as usize, 0.0);
-        flip.precondition_temp.resize(flip.cells as usize, 0.0);
+        flip.smoothed_error.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.current_error.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.search_vector.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.matrix_times_search.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.diag_laplacian.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.plus_x_laplacian.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.plus_y_laplacian.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.precondition.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        flip.precondition_temp.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
 
         flip.part_positions.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_velocities.resize((flip.cells / 2) as usize, Vec2x8::zero());
@@ -366,17 +400,19 @@ impl Apic {
             return 0;
         }
 
-        let index = ((j * self.width as i32) + i) as u32;
-        let fluid = self.mac_type_fluid[(index / 64) as usize];
+        unsafe {
+            let index = ((j * self.width as i32) + i) as u32;
+            let fluid = *self.mac_type_fluid.get_unchecked((index >> 6) as usize);
 
-        return 1 & (fluid >> (index % 64));
+            return 1 & (fluid >> (index & 63));
+        }
     }
 
     #[inline(always)]
     pub fn is_fluid_index(&self, index: usize) -> u64 {
         unsafe {
             let fluid = *self.mac_type_fluid.get_unchecked(index >> 6);
-            1 & (fluid >> (index & 63))
+            return 1 & (fluid >> (index & 63));
         }
     }
 
@@ -819,6 +855,8 @@ impl Apic {
             }
         }
 
+        self.fluid_cells = 0;
+
         for i in 0..self.mac_type_fluid.len() {
             self.mac_type_fluid[i] &= !self.mac_type_obstacle[i];
 
@@ -827,8 +865,18 @@ impl Apic {
             while fluid_mask != 0 {
                 let cell_index = (i * 64) + (fluid_mask.trailing_zeros() as usize);
                 self.mac_fluid_index.push(cell_index as u32);
+                self.fluid_cells += 1;
 
                 fluid_mask &= fluid_mask - 1;
+            }
+        }
+
+        let remainder = self.fluid_cells % 8;
+        if remainder != 0 {
+            let padding = 8 - remainder;
+            let last_val = self.mac_fluid_index[self.fluid_cells as usize - 1];
+            for _ in 0..padding {
+                self.mac_fluid_index.push(last_val);
             }
         }
     }
@@ -866,7 +914,7 @@ impl Apic {
             return 1.0; 
         }
         
-        ((rho_center - threshold) / diff).clamp(0.1, 1.0)
+        return ((rho_center - threshold) / diff).clamp(0.1, 1.0);
     }
 
     pub fn build_pressure_system(&mut self) {
@@ -988,7 +1036,7 @@ impl Apic {
         let width = self.width as usize;
 
         unsafe {
-            for cell_index in self.mac_fluid_index.iter() {
+            for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter() {
                 let fluid_index = *cell_index as usize;
 
                 let mut sum = *self.current_error.get_unchecked(fluid_index);
@@ -1011,7 +1059,7 @@ impl Apic {
         }
 
         unsafe {
-            for cell_index in self.mac_fluid_index.iter().rev() {
+            for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter().rev() {
                 let fluid_index = *cell_index as usize;
 
                 let mut sum = *self.precondition_temp.get_unchecked(fluid_index);
@@ -1039,7 +1087,7 @@ impl Apic {
         self.precondition.fill(0.0);
 
         unsafe {
-            for cell_index in self.mac_fluid_index.iter() {
+            for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter() {
                 let fluid_index = *cell_index as usize;
 
                 *self.mac_pressure_grid.get_unchecked_mut(fluid_index) = 0.0;
@@ -1047,7 +1095,7 @@ impl Apic {
         }
 
         unsafe {
-            for cell_index in self.mac_fluid_index.iter() {
+            for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter() {
                 let index = *cell_index as usize;
 
                 let mut ap_value = self.diag_laplacian[index] * self.mac_pressure_grid[index];
@@ -1098,7 +1146,7 @@ impl Apic {
         for _ in 0..max_iterations {
             self.matrix_times_search.fill(0.0);
             unsafe {
-                for cell_index in self.mac_fluid_index.iter() {
+                for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter() {
                     let index = *cell_index as usize;
 
                     let mut value = *self.diag_laplacian.get_unchecked(index) * *self.search_vector.get_unchecked(index);
@@ -1121,7 +1169,7 @@ impl Apic {
 
             let mut max_error: f32 = 0.0;
             unsafe {
-                for cell_index in self.mac_fluid_index.iter() {
+                for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter() {
                     let index = *cell_index as usize;
 
                     *self.mac_pressure_grid.get_unchecked_mut(index) += alpha * *self.search_vector.get_unchecked(index);
@@ -1147,7 +1195,7 @@ impl Apic {
             let beta = new_sigma / sigma;
 
              unsafe {
-                for cell_index in self.mac_fluid_index.iter() {
+                for cell_index in self.mac_fluid_index[..self.fluid_cells as usize].iter() {
                     let index = *cell_index as usize;
 
                     *self.search_vector.get_unchecked_mut(index) = *self.smoothed_error.get_unchecked(index) + (beta * *self.search_vector.get_unchecked(index));
