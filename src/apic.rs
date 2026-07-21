@@ -8,19 +8,36 @@ use wide::{CmpGt, CmpLt, f32x8, i32x8, u32x8};
 const SAFTY: f32 = 1e-20;
 
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum0 = f32x8::ZERO;
+    let mut sum1 = f32x8::ZERO;
+    let mut sum2 = f32x8::ZERO;
+    let mut sum3 = f32x8::ZERO;
     
-    let mut sum = f32x8::ZERO;
-    let (chunks_a, reminder_a) = a.as_chunks::<8>();
-    let (chunks_b, reminder_b) = b.as_chunks::<8>();
+    let (chunks_a, remainder_a) = a.as_chunks::<32>();
+    let (chunks_b, remainder_b) = b.as_chunks::<32>();
     
     for (chunk_a, chunk_b) in chunks_a.iter().zip(chunks_b.iter()) {
-        let va = f32x8::from(*chunk_a);
-        let vb = f32x8::from(*chunk_b);
-        sum += va * vb;
+        let a_ptr = chunk_a.as_ptr() as *const [f32; 8];
+        let b_ptr = chunk_b.as_ptr() as *const [f32; 8];
+        unsafe {
+            sum0 = sum0 + f32x8::from(*a_ptr) * f32x8::from(*b_ptr);
+            sum1 = sum1 + f32x8::from(*a_ptr.add(1)) * f32x8::from(*b_ptr.add(1));
+            sum2 = sum2 + f32x8::from(*a_ptr.add(2)) * f32x8::from(*b_ptr.add(2));
+            sum3 = sum3 + f32x8::from(*a_ptr.add(3)) * f32x8::from(*b_ptr.add(3));
+        }
+    }
+    
+    let mut sum = sum0 + sum1 + sum2 + sum3;
+    
+    let (chunks_a_8, remainder_a_8) = remainder_a.as_chunks::<8>();
+    let (chunks_b_8, remainder_b_8) = remainder_b.as_chunks::<8>();
+    
+    for (chunk_a, chunk_b) in chunks_a_8.iter().zip(chunks_b_8.iter()) {
+        sum += f32x8::from(*chunk_a) * f32x8::from(*chunk_b);
     }
     
     let mut result = sum.to_array().iter().sum();
-    for (remainder_a, remainder_b) in reminder_a.iter().zip(reminder_b.iter()) {
+    for (remainder_a, remainder_b) in remainder_a_8.iter().zip(remainder_b_8.iter()) {
         result += remainder_a * remainder_b;
     }
     
@@ -212,8 +229,6 @@ impl MultiGridLevel {
 
         let process = |&index: &u32| {
             let cell_index = index as usize;
-            let x = cell_index % width;
-            let y = cell_index / width;
 
             unsafe {
                 let diag = *diag_lap.get_unchecked(cell_index);
@@ -223,7 +238,7 @@ impl MultiGridLevel {
                     let px = *plus_x.get_unchecked(cell_index);
                     if px != 0.0 { sum -= px * *error_ptr.add(cell_index + 1); }
 
-                    if x > 0 {
+                    if cell_index > 0 {
                         let nx = *plus_x.get_unchecked(cell_index - 1);
                         if nx != 0.0 { sum -= nx * *error_ptr.add(cell_index - 1); }
                     }
@@ -231,7 +246,7 @@ impl MultiGridLevel {
                     let py = *plus_y.get_unchecked(cell_index);
                     if py != 0.0 { sum -= py * *error_ptr.add(cell_index + width); }
 
-                    if y > 0 {
+                    if cell_index >= width {
                         let ny = *plus_y.get_unchecked(cell_index - width);
                         if ny != 0.0 { sum -= ny * *error_ptr.add(cell_index - width); }
                     }
@@ -245,16 +260,16 @@ impl MultiGridLevel {
         for _ in 0..iterations {
             if reverse {
                 if use_parallel {
-                    self.black_indices.par_iter().with_min_len(4096).for_each(process);
-                    self.red_indices.par_iter().with_min_len(4096).for_each(process);
+                    self.black_indices.par_iter().for_each(process);
+                    self.red_indices.par_iter().for_each(process);
                 } else {
                     self.black_indices.iter().for_each(process);
                     self.red_indices.iter().for_each(process);
                 }
             } else {
                 if use_parallel {
-                    self.red_indices.par_iter().with_min_len(4096).for_each(process);
-                    self.black_indices.par_iter().with_min_len(4096).for_each(process);
+                    self.red_indices.par_iter().for_each(process);
+                    self.black_indices.par_iter().for_each(process);
                 } else {
                     self.red_indices.iter().for_each(process);
                     self.black_indices.iter().for_each(process);
@@ -311,7 +326,7 @@ impl MultiGridLevel {
         };
 
         if coarse.fluid_indices.len() > 4096 {
-            coarse.fluid_indices.par_iter().with_min_len(4096).for_each(process);
+            coarse.fluid_indices.par_iter().for_each(process);
         } else {
             coarse.fluid_indices.iter().for_each(process);
         }
@@ -331,7 +346,7 @@ impl MultiGridLevel {
         };
 
         if self.fluid_indices.len() > 4096 {
-            self.fluid_indices.par_iter().with_min_len(4096).for_each(process);
+            self.fluid_indices.par_iter().for_each(process);
         } else {
             self.fluid_indices.iter().for_each(process);
         }
@@ -1382,19 +1397,16 @@ impl Apic {
         let width = self.width as usize;
 
         for _ in 0..max_iterations {
-            self.matrix_times_search.fill(0.0);
             unsafe {
                 for cell_index in self.base_grid.fluid_indices[..self.fluid_cells as usize].iter() {
                     let index = *cell_index as usize;
-                    let x = index % width;
-                    let y = index / width;
 
                     let mut value = *self.base_grid.diag_laplacian.get_unchecked(index) * *self.search_vector.get_unchecked(index);
                     
                     let px = *self.base_grid.plus_x_laplacian.get_unchecked(index);
                     if px != 0.0 { value = px.mul_add(*self.search_vector.get_unchecked(index + 1), value); }
 
-                    if x > 0 {
+                    if index > 0 {
                         let nx = *self.base_grid.plus_x_laplacian.get_unchecked(index - 1);
                         if nx != 0.0 { value = nx.mul_add(*self.search_vector.get_unchecked(index - 1), value); }
                     }
@@ -1402,7 +1414,7 @@ impl Apic {
                     let py = *self.base_grid.plus_y_laplacian.get_unchecked(index);
                     if py != 0.0 { value = py.mul_add(*self.search_vector.get_unchecked(index + width), value); }
 
-                    if y > 0 {
+                    if index >= width {
                         let ny = *self.base_grid.plus_y_laplacian.get_unchecked(index - width);
                         if ny != 0.0 { value = ny.mul_add(*self.search_vector.get_unchecked(index - width), value); }
                     }
@@ -1799,7 +1811,7 @@ impl Apic {
         let max_y = (((world_y + radius) / self.cell_size).ceil() as i32).min(self.height as i32) as u32;
 
         let radius_sq = radius * radius;
-        let is_repel = strength > 0.0; // Route positive pushing to post_force
+        let is_repel = strength > 0.0;
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
