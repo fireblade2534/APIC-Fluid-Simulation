@@ -146,7 +146,7 @@ async fn main() {
         }
         let sim_time_ms = sim_start_time.elapsed().as_secs_f32() * 1000.0;
         
-        let active_fluid_cells: u32 = simulation.mac_type_fluid.iter().map(|&mask| mask.count_ones()).sum();
+        let active_fluid_cells: u32 = simulation.base_grid.type_fluid.iter().map(|&mask| mask.count_ones()).sum();
         let current_volume = active_fluid_cells as f32 * (CELL_SIZE * CELL_SIZE);
         
         if initial_volume == 0.0 && current_volume > 0.0 {
