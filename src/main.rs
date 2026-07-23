@@ -18,8 +18,8 @@ use macroquad::{
 const WIDTH: f32 = 1920.0;
 const HEIGHT: f32 = 1080.0;
 const CELL_SIZE: f32 = 0.075;
-const GRID_WIDTH: u32 = 160;
-const GRID_HEIGHT: u32 = 90;
+const GRID_WIDTH: u32 = 256;
+const GRID_HEIGHT: u32 = 128;
 const SIM_SCALE: f32 = WIDTH / (GRID_WIDTH as f32 * CELL_SIZE);
 const DRAW_RADIUS: f32 = 3.0;
 

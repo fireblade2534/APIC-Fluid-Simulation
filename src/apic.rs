@@ -1,7 +1,7 @@
 use std::{cell, mem};
 use rdst::{RadixKey, RadixSort};
 
-use rayon::{iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator}, slice::ParallelSlice};
+use rayon::{iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator}, slice::{ParallelSlice, ParallelSliceMut}};
 use ultraviolet::{Vec2, Vec2x8};
 use wide::{CmpGt, CmpLe, CmpLt, f32x8, i32x8, u32x8};
 
@@ -41,8 +41,7 @@ pub fn temporal_kernel_w_t(tau: f32x8) -> f32x8 {
     
     let w_t = w_poly6 * f32x8::splat(2.1875);
     
-    let mask = tau.cmp_le(half);
-    mask.blend(w_t, zero)
+    w_t.fast_max(f32x8::splat(1e-5))
 }
 
 #[inline(always)]
@@ -390,6 +389,13 @@ pub struct LocalGrid {
     pub mac_weight_v: Vec<f32>,
     pub mac_density: Vec<f32>,
     pub type_fluid: Vec<u64>,
+
+    pub min_index_u: usize,
+    pub min_index_v: usize,
+    pub min_index_grid: usize,
+    pub max_index_u: usize,
+    pub max_index_v: usize,
+    pub max_index_grid: usize,
 }
 
 #[derive(Default, Clone)]
@@ -493,6 +499,13 @@ impl Apic {
                 mac_weight_v: vec![0.0; (flip.cells + flip.width) as usize],
                 mac_density: vec![0.0; (flip.cells.div_ceil(8) * 8) as usize],
                 type_fluid: vec![0; flip.base_grid.type_fluid.len()],
+
+                min_index_u: 0,
+                min_index_v: 0,
+                min_index_grid: 0,
+                max_index_u: (flip.cells + flip.height) as usize,
+                max_index_v: (flip.cells + flip.width) as usize,
+                max_index_grid: flip.cells as usize,
             });
         }
 
@@ -694,7 +707,9 @@ impl Apic {
         let max_x = f32x8::splat(self.width.saturating_sub(1) as f32);
         let max_y = f32x8::splat(self.height.saturating_sub(1) as f32);
 
-        for chunk_index in 0..self.num_chunks as usize {
+        let num_particles = self.num_particles as usize;
+
+        self.part_sort[..num_particles].par_chunks_mut(8).enumerate().with_min_len(512).for_each(|(chunk_index, sort_chunk)| {
             let positions = self.part_positions[chunk_index];
             let grid_space_positions = positions / f32x8::splat(self.cell_size);
 
@@ -703,73 +718,53 @@ impl Apic {
 
             let grid_indexes: u32x8 = morton_code(grid_x, grid_y);
 
-            let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
-                self.num_particles % 8
-            } else {
-                8
-            };
-
-            for lane in 0..active_lanes as usize {
+            let active_lanes = sort_chunk.len();
+            for lane in 0..active_lanes {
                 let particle_index = (chunk_index * 8) + lane;
-                self.part_sort[particle_index].key = grid_indexes.as_array_ref()[lane];
-                self.part_sort[particle_index].val = particle_index as u32;
+                sort_chunk[lane].key = grid_indexes.as_array_ref()[lane];
+                sort_chunk[lane].val = particle_index as u32;
             }
-        }
+        });
 
-        //self.part_lookup.fill((u32::MAX, u32::MAX));
-        self.part_sort[..self.num_particles as usize].radix_sort_unstable();
+        self.part_sort[..num_particles].radix_sort_unstable();
 
-        let mut position_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
-        let mut velocity_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
-        let mut c_u_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
-        let mut c_v_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
-        let mut t_res_buffer: [f32; 8] = [0f32; 8];
+        self.part_positions_sort.par_iter_mut()
+            .zip(self.part_velocities_sort.par_iter_mut())
+            .zip(self.part_c_u_sort.par_iter_mut())
+            .zip(self.part_c_v_sort.par_iter_mut())
+            .zip(self.part_time_residual_sort.par_iter_mut())
+            .zip(self.part_sort.par_chunks(8))
+            .with_min_len(1024)
+            .for_each(|(((((position, velocity), c_u), c_v), residual), sort_chunk)| {
+                
+                let mut position_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+                let mut velocity_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+                let mut c_u_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+                let mut c_v_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+                let mut t_res_buffer: [f32; 8] = [0f32; 8];
 
-        //let mut previous_hash: u32 = u32::MAX;
-        for (index, tuple) in self.part_sort.iter().enumerate() {
+                for (buffer_index, tuple) in sort_chunk.iter().enumerate() {
+                    let payload = tuple.val;
+                    let chunk_index = (payload >> 3) as usize;
+                    let lane = (payload & 7) as usize; 
 
-            let hash = tuple.key;
-            let payload = tuple.val;
-
-            let buffer_index = index & 7;
-
-            let chunk_index = (payload >> 3) as usize;
-            let lane = (payload & 7) as usize; 
-
-            position_buffer[0][buffer_index] = self.part_positions[chunk_index].x.as_array_ref()[lane];
-            position_buffer[1][buffer_index] = self.part_positions[chunk_index].y.as_array_ref()[lane];
-            velocity_buffer[0][buffer_index] = self.part_velocities[chunk_index].x.as_array_ref()[lane];
-            velocity_buffer[1][buffer_index] = self.part_velocities[chunk_index].y.as_array_ref()[lane];
-            c_u_buffer[0][buffer_index] = self.part_c_u[chunk_index].x.as_array_ref()[lane];
-            c_u_buffer[1][buffer_index] = self.part_c_u[chunk_index].y.as_array_ref()[lane];
-            c_v_buffer[0][buffer_index] = self.part_c_v[chunk_index].x.as_array_ref()[lane];
-            c_v_buffer[1][buffer_index] = self.part_c_v[chunk_index].y.as_array_ref()[lane];
-            t_res_buffer[buffer_index] = self.part_time_residual[chunk_index].as_array_ref()[lane];
-
-            if buffer_index == 7 {
-                self.part_positions_sort[index / 8] = Vec2x8 { x: position_buffer[0].into(), y: position_buffer[1].into() };
-                self.part_velocities_sort[index / 8] = Vec2x8 { x: velocity_buffer[0].into(), y: velocity_buffer[1].into() };
-                self.part_c_u_sort[index / 8] = Vec2x8 { x: c_u_buffer[0].into(), y: c_u_buffer[1].into() };
-                self.part_c_v_sort[index / 8] = Vec2x8 { x: c_v_buffer[0].into(), y: c_v_buffer[1].into() };
-                self.part_time_residual_sort[index / 8] = f32x8::from(t_res_buffer);
-            }
-
-            /*
-            if previous_hash != hash {
-                if previous_hash != u32::MAX {
-                    self.part_lookup[previous_hash as usize].1 = index as u32;
+                    position_buffer[0][buffer_index] = self.part_positions[chunk_index].x.as_array_ref()[lane];
+                    position_buffer[1][buffer_index] = self.part_positions[chunk_index].y.as_array_ref()[lane];
+                    velocity_buffer[0][buffer_index] = self.part_velocities[chunk_index].x.as_array_ref()[lane];
+                    velocity_buffer[1][buffer_index] = self.part_velocities[chunk_index].y.as_array_ref()[lane];
+                    c_u_buffer[0][buffer_index] = self.part_c_u[chunk_index].x.as_array_ref()[lane];
+                    c_u_buffer[1][buffer_index] = self.part_c_u[chunk_index].y.as_array_ref()[lane];
+                    c_v_buffer[0][buffer_index] = self.part_c_v[chunk_index].x.as_array_ref()[lane];
+                    c_v_buffer[1][buffer_index] = self.part_c_v[chunk_index].y.as_array_ref()[lane];
+                    t_res_buffer[buffer_index] = self.part_time_residual[chunk_index].as_array_ref()[lane];
                 }
 
-                self.part_lookup[hash as usize].0 = index as u32;
-                previous_hash = hash;
-            }
-            */
-        }
-        /*
-        if previous_hash != u32::MAX {
-            self.part_lookup[previous_hash as usize].1 = self.num_particles;
-        }
-        */
+                *position = Vec2x8 { x: position_buffer[0].into(), y: position_buffer[1].into() };
+                *velocity = Vec2x8 { x: velocity_buffer[0].into(), y: velocity_buffer[1].into() };
+                *c_u = Vec2x8 { x: c_u_buffer[0].into(), y: c_u_buffer[1].into() };
+                *c_v = Vec2x8 { x: c_v_buffer[0].into(), y: c_v_buffer[1].into() };
+                *residual = f32x8::from(t_res_buffer);
+            });
 
         mem::swap(&mut self.part_positions, &mut self.part_positions_sort);
         mem::swap(&mut self.part_velocities, &mut self.part_velocities_sort);
@@ -911,6 +906,12 @@ impl Apic {
             local_grid.mac_weight_v.fill(0.0);
             local_grid.mac_density.fill(0.0);
             local_grid.type_fluid.fill(0);
+            local_grid.min_index_u = (self.cells + self.height) as usize;
+            local_grid.min_index_v = (self.cells + self.width) as usize;
+            local_grid.min_index_grid = self.cells as usize;
+            local_grid.max_index_u = 0;
+            local_grid.max_index_v = 0;
+            local_grid.max_index_grid = 0;
 
             let start = thread_index * chunk_size;
             let end = (start + chunk_size).min(self.num_chunks as usize);
@@ -1101,6 +1102,8 @@ impl Apic {
                         *local_grid.mac_weight_u.get_unchecked_mut(ubr) += *u_wt_back_right_arr.get_unchecked(lane);
                         *local_grid.mac_weight_u.get_unchecked_mut(utl) += *u_wt_top_left_arr.get_unchecked(lane);
                         *local_grid.mac_weight_u.get_unchecked_mut(utr) += *u_wt_top_right_arr.get_unchecked(lane);
+                        local_grid.min_index_u = local_grid.min_index_u.min(ubl).min(ubr).min(utl).min(utr);
+                        local_grid.max_index_u = local_grid.max_index_u.max(ubl).max(ubr).max(utl).max(utr);
 
                         let vbl = *vbl_idx.get_unchecked(lane) as usize;
                         let vbr = *vbr_idx.get_unchecked(lane) as usize;
@@ -1114,6 +1117,8 @@ impl Apic {
                         *local_grid.mac_weight_v.get_unchecked_mut(vbr) += *v_wt_back_right_arr.get_unchecked(lane);
                         *local_grid.mac_weight_v.get_unchecked_mut(vtl) += *v_wt_top_left_arr.get_unchecked(lane);
                         *local_grid.mac_weight_v.get_unchecked_mut(vtr) += *v_wt_top_right_arr.get_unchecked(lane);
+                        local_grid.min_index_v = local_grid.min_index_v.min(vbl).min(vbr).min(vtl).min(vtr);
+                        local_grid.max_index_v = local_grid.max_index_v.max(vbl).max(vbr).max(vtl).max(vtr);
 
                         let cbl = *cbl_idx.get_unchecked(lane) as usize;
                         let cbr = *cbr_idx.get_unchecked(lane) as usize;
@@ -1123,6 +1128,8 @@ impl Apic {
                         *local_grid.mac_density.get_unchecked_mut(cbr) += *c_wt_back_right_arr.get_unchecked(lane);
                         *local_grid.mac_density.get_unchecked_mut(ctl) += *c_wt_top_left_arr.get_unchecked(lane);
                         *local_grid.mac_density.get_unchecked_mut(ctr) += *c_wt_top_right_arr.get_unchecked(lane);
+                        local_grid.min_index_grid = local_grid.min_index_grid.min(cbl).min(cbr).min(ctl).min(ctr);
+                        local_grid.max_index_grid = local_grid.max_index_grid.max(cbl).max(cbr).max(ctl).max(ctr);
                     }
                 }
             }
@@ -1132,27 +1139,29 @@ impl Apic {
         let (left, right) = self.local_grids.split_at_mut(1);
 
         for local_grid in right.iter() {
-            left[0].mac_u.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_u).for_each(|(main, local)| {
+            left[0].mac_u[local_grid.min_index_u..=local_grid.max_index_u].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_u[local_grid.min_index_u..=local_grid.max_index_u]).for_each(|(main, local)| {
                 *main += local;
             });
 
-            left[0].mac_v.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_v).for_each(|(main, local)| {
+            left[0].mac_v[local_grid.min_index_v..=local_grid.max_index_v].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_v[local_grid.min_index_v..=local_grid.max_index_v]).for_each(|(main, local)| {
                 *main += local;
             });
 
-            left[0].mac_weight_u.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_u).for_each(|(main, local)| {
+            left[0].mac_weight_u[local_grid.min_index_u..=local_grid.max_index_u].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_u[local_grid.min_index_u..=local_grid.max_index_u]).for_each(|(main, local)| {
                 *main += local;
             });
 
-            left[0].mac_weight_v.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_v).for_each(|(main, local)| {
+            left[0].mac_weight_v[local_grid.min_index_v..=local_grid.max_index_v].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_v[local_grid.min_index_v..=local_grid.max_index_v]).for_each(|(main, local)| {
                 *main += local;
             });
 
-            left[0].mac_density.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_density).for_each(|(main, local)| {
+            left[0].mac_density[local_grid.min_index_grid..=local_grid.max_index_grid].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_density[local_grid.min_index_grid..=local_grid.max_index_grid]).for_each(|(main, local)| {
                 *main += local;
             });
+        }
 
-            left[0].type_fluid.par_iter_mut().with_min_len(4096).zip(&local_grid.type_fluid).for_each(|(main, local)| {
+        for local_grid in self.local_grids.iter() {
+            self.base_grid.type_fluid.par_iter_mut().with_min_len(4096).zip(&local_grid.type_fluid).for_each(|(main, local)| {
                 *main |= local;
             });
         }
