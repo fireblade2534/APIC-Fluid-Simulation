@@ -1130,31 +1130,33 @@ impl Apic {
 
 
         let (left, right) = self.local_grids.split_at_mut(1);
+
+        for local_grid in right.iter() {
+            left[0].mac_u.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_u).for_each(|(main, local)| {
+                *main += local;
+            });
+
+            left[0].mac_v.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_v).for_each(|(main, local)| {
+                *main += local;
+            });
+
+            left[0].mac_weight_u.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_u).for_each(|(main, local)| {
+                *main += local;
+            });
+
+            left[0].mac_weight_v.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_v).for_each(|(main, local)| {
+                *main += local;
+            });
+
+            left[0].mac_density.par_iter_mut().with_min_len(4096).zip(&local_grid.mac_density).for_each(|(main, local)| {
+                *main += local;
+            });
+
+            left[0].type_fluid.par_iter_mut().with_min_len(4096).zip(&local_grid.type_fluid).for_each(|(main, local)| {
+                *main |= local;
+            });
+        }
         
-        left[0].mac_u.par_iter_mut().enumerate().for_each(|(index, value)| {
-            *value += right.iter().map(|grid| {grid.mac_u[index]}).sum::<f32>();
-        });
-
-        left[0].mac_v.par_iter_mut().enumerate().for_each(|(index, value)| {
-            *value += right.iter().map(|grid| {grid.mac_v[index]}).sum::<f32>();
-        });
-
-        left[0].mac_weight_u.par_iter_mut().enumerate().for_each(|(index, value)| {
-            *value += right.iter().map(|grid| {grid.mac_weight_u[index]}).sum::<f32>();
-        });
-
-        left[0].mac_weight_v.par_iter_mut().enumerate().for_each(|(index, value)| {
-            *value += right.iter().map(|grid| {grid.mac_weight_v[index]}).sum::<f32>();
-        });
-
-        left[0].mac_density.par_iter_mut().enumerate().for_each(|(index, value)| {
-            *value += right.iter().map(|grid| {grid.mac_density[index]}).sum::<f32>();
-        });
-
-        self.base_grid.type_fluid.par_iter_mut().enumerate().for_each(|(index, value)| {
-            *value |= self.local_grids.iter().fold(0, |acc, grid| {acc | grid.type_fluid[index]});
-        });
-
         let grid = &mut self.local_grids[0];
         grid.mac_u.par_iter_mut()
             .zip(grid.mac_weight_u.par_iter())
