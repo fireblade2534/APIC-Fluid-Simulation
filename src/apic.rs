@@ -499,8 +499,6 @@ impl Apic {
         flip.part_sort.resize((flip.cells / 2) as usize, SortableTuple::new(0, 0));
         flip.num_chunks = flip.cells / 2;
 
-        flip.part_time_residual.resize(flip.num_chunks as usize, f32x8::ZERO);
-        flip.part_time_residual_sort.resize(flip.num_chunks as usize, f32x8::ZERO);
         flip.prev_deltatime = 1.0 / 60.0;
 
         flip.external_force_u.resize((flip.cells + flip.height) as usize, 0.0);
@@ -545,8 +543,11 @@ impl Apic {
         flip.part_velocities_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
         flip.part_c_u_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
         flip.part_c_v_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
+        flip.part_time_residual.resize(flip.num_chunks as usize, f32x8::ZERO);
+        flip.part_time_residual_sort.resize(flip.num_chunks as usize, f32x8::ZERO);
+
         let max_dim = flip.width.max(flip.height).next_power_of_two();
-        let lookup_size = (max_dim * max_dim) as usize;
+        //let lookup_size = (max_dim * max_dim) as usize;
         //flip.part_lookup.resize(lookup_size, (0, 0));
         flip.part_sort.resize(flip.num_particles as usize, SortableTuple::new(0, 0));
 
@@ -1694,7 +1695,7 @@ impl Apic {
     }
 
     pub fn transfer_grid_to_particles_and_advect(&mut self, deltatime: f32) {
-        let dt = f32x8::splat(deltatime);
+        let deltatime = f32x8::splat(deltatime);
 
         let min_x = f32x8::splat(1.001 * self.cell_size);
         let max_x = f32x8::splat((self.width as f32 - 1.001) * self.cell_size);
@@ -1809,19 +1810,19 @@ impl Apic {
             let residual = *residual_org;
             
             let speed = new_velocity.mag();
-            let cfl_local = speed * dt / f32x8::splat(cell_size);
+            let cfl_local = speed * deltatime / f32x8::splat(cell_size);
 
-            let s = cfl_local.fast_max(zero).fast_min(f32x8::splat(1.0));
-            let gamma = s * s * (f32x8::splat(3.0) - f32x8::splat(2.0) * s);
+            let scale = cfl_local.fast_max(zero).fast_min(f32x8::splat(1.0));
+            let gamma = scale * scale * (f32x8::splat(3.0) - f32x8::splat(2.0) * scale);
             
-            let jitter = gamma * Apic::random_simd(chunk_index, timestamp) * dt;
+            let jitter = gamma * Apic::random_simd(chunk_index, timestamp) * deltatime;
             
-            let dt_raw = dt + residual + jitter;
-            let dt_act = dt_raw.fast_max(zero).fast_min(dt * f32x8::splat(2.0));
+            let deltatime_raw = deltatime + residual + jitter;
+            let deltatime_act = deltatime_raw.fast_max(zero).fast_min(deltatime * f32x8::splat(2.0));
             
-            *residual_org = dt + residual - dt_act;
+            *residual_org = deltatime + residual - deltatime_act;
             
-            let mut new_positions = *positions + dt_act * new_velocity;
+            let mut new_positions = *positions + deltatime_act * new_velocity;
 
             let out_x_min = new_positions.x.cmp_lt(min_x);
             let out_x_max = new_positions.x.cmp_gt(max_x);
