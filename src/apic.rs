@@ -3,7 +3,7 @@ use rdst::{RadixKey, RadixSort};
 
 use rayon::{iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator}, slice::ParallelSlice};
 use ultraviolet::{Vec2, Vec2x8};
-use wide::{CmpGt, CmpLt, f32x8, i32x8, u32x8};
+use wide::{CmpGt, CmpLe, CmpLt, f32x8, i32x8, u32x8};
 
 const SAFTY: f32 = 1e-5;
 
@@ -25,6 +25,24 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     }
     
     return result;
+}
+
+#[inline(always)]
+pub fn temporal_kernel_w_t(tau: f32x8) -> f32x8 {
+    let half = f32x8::splat(0.5);
+    let zero = f32x8::ZERO;
+    let one = f32x8::splat(1.0);
+    
+    let tau_shifted = tau - half;
+    let t_sq = tau_shifted * tau_shifted;
+    
+    let inner = (one - t_sq).fast_max(zero);
+    let w_poly6 = inner * inner * inner;
+    
+    let w_t = w_poly6 * f32x8::splat(2.1875);
+    
+    let mask = tau.cmp_le(half);
+    mask.blend(w_t, zero)
 }
 
 #[inline(always)]
@@ -368,8 +386,8 @@ impl MultiGridLevel {
 pub struct WorldProperties {
     pub gravity: f32,
     pub border_damping: f32,
-    pub cfl: f32,
-    pub solve_error: f32,
+    pub cfl: f32, // Recommended value is 5.0
+    pub solve_error: f32, // Recommended value is 1e-5
 }
 
 #[derive(Default)]
@@ -420,6 +438,8 @@ pub struct Apic {
     pub part_velocities_sort: Vec<Vec2x8>,
     pub part_c_u_sort: Vec<Vec2x8>,
     pub part_c_v_sort: Vec<Vec2x8>,
+    pub part_time_residual: Vec<f32x8>,
+    pub part_time_residual_sort: Vec<f32x8>,
 
     pub fluid_cells: u32,
 
@@ -427,6 +447,7 @@ pub struct Apic {
     pub multigrid_levels: Vec<MultiGridLevel>,
 
     pub timestamp: u32,
+    pub prev_deltatime: f32,
 }
 
 impl Apic {
@@ -477,6 +498,10 @@ impl Apic {
         //flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
         flip.part_sort.resize((flip.cells / 2) as usize, SortableTuple::new(0, 0));
         flip.num_chunks = flip.cells / 2;
+
+        flip.part_time_residual.resize(flip.num_chunks as usize, f32x8::ZERO);
+        flip.part_time_residual_sort.resize(flip.num_chunks as usize, f32x8::ZERO);
+        flip.prev_deltatime = 1.0 / 60.0;
 
         flip.external_force_u.resize((flip.cells + flip.height) as usize, 0.0);
         flip.external_force_v.resize((flip.cells + flip.width) as usize, 0.0);
@@ -563,7 +588,7 @@ impl Apic {
     }
 
     #[inline(always)]
-    pub fn random_simd(&self, chunk_index: usize, seed: u32) -> f32x8 {
+    pub fn random_simd(chunk_index: usize, seed: u32) -> f32x8 {
         let base_idx = (chunk_index * 8) as u32;
         let lanes = u32x8::from([
             base_idx,
@@ -683,6 +708,7 @@ impl Apic {
         let mut velocity_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
         let mut c_u_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
         let mut c_v_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
+        let mut t_res_buffer: [f32; 8] = [0f32; 8];
 
         //let mut previous_hash: u32 = u32::MAX;
         for (index, tuple) in self.part_sort.iter().enumerate() {
@@ -703,12 +729,14 @@ impl Apic {
             c_u_buffer[1][buffer_index] = self.part_c_u[chunk_index].y.as_array_ref()[lane];
             c_v_buffer[0][buffer_index] = self.part_c_v[chunk_index].x.as_array_ref()[lane];
             c_v_buffer[1][buffer_index] = self.part_c_v[chunk_index].y.as_array_ref()[lane];
+            t_res_buffer[buffer_index] = self.part_time_residual[chunk_index].as_array_ref()[lane];
 
             if buffer_index == 7 {
                 self.part_positions_sort[index / 8] = Vec2x8 { x: position_buffer[0].into(), y: position_buffer[1].into() };
                 self.part_velocities_sort[index / 8] = Vec2x8 { x: velocity_buffer[0].into(), y: velocity_buffer[1].into() };
                 self.part_c_u_sort[index / 8] = Vec2x8 { x: c_u_buffer[0].into(), y: c_u_buffer[1].into() };
                 self.part_c_v_sort[index / 8] = Vec2x8 { x: c_v_buffer[0].into(), y: c_v_buffer[1].into() };
+                self.part_time_residual_sort[index / 8] = f32x8::from(t_res_buffer);
             }
 
             /*
@@ -732,6 +760,7 @@ impl Apic {
         mem::swap(&mut self.part_velocities, &mut self.part_velocities_sort);
         mem::swap(&mut self.part_c_u, &mut self.part_c_u_sort);
         mem::swap(&mut self.part_c_v, &mut self.part_c_v_sort);
+        mem::swap(&mut self.part_time_residual, &mut self.part_time_residual_sort);
     }
 
     #[inline(always)]
@@ -852,17 +881,11 @@ impl Apic {
             let raw_positions = self.part_positions[chunk_index];
             let velocities = self.part_velocities[chunk_index];
 
-            let temporal_jitter = self.random_simd(chunk_index, timestamp) * f32x8::splat(deltatime);
-            let seed_x = timestamp.wrapping_mul(73856093) ^ 0x193a6754;
-            let seed_y = timestamp.wrapping_mul(19349663) ^ 0x45678912;
+            let positions = raw_positions;
+            let prev_dt = f32x8::splat(self.prev_deltatime);
+            let tau = -self.part_time_residual[chunk_index] / prev_dt;
+            let w_t = temporal_kernel_w_t(tau);
 
-            let max_spatial_jitter = f32x8::splat(self.cell_size);
-            let spatial_jitter_x = self.random_simd(chunk_index, seed_x) * max_spatial_jitter;
-            let spatial_jitter_y = self.random_simd(chunk_index, seed_y) * max_spatial_jitter;
-
-            let mut positions = raw_positions + (velocities * temporal_jitter);
-            positions.x += spatial_jitter_x;
-            positions.y += spatial_jitter_y;
 
             let c_u = self.part_c_u[chunk_index];
             let c_v = self.part_c_v[chunk_index];
@@ -881,10 +904,10 @@ impl Apic {
             let c_tx = c_grid_x - c_base_x;
             let c_ty = c_grid_y - c_base_y;
             
-            let c_weight_back_left = (one - c_tx) * (one - c_ty);
-            let c_weight_back_right = c_tx * (one - c_ty);
-            let c_weight_top_left = (one - c_tx) * c_ty;
-            let c_weight_top_right = c_tx * c_ty;
+            let c_weight_back_left = ((one - c_tx) * (one - c_ty)) * w_t;
+            let c_weight_back_right = (c_tx * (one - c_ty)) * w_t;
+            let c_weight_top_left = ((one - c_tx) * c_ty) * w_t;
+            let c_weight_top_right = (c_tx * c_ty) * w_t;
 
             let max_x = i32x8::splat(self.width as i32 - 1);
             let max_y = i32x8::splat(self.height as i32 - 1);
@@ -901,22 +924,17 @@ impl Apic {
 
             // U GRID
             let (
-                u_weight_bottom_left,
-                u_weight_bottom_right,
-                u_weight_top_left,
-                u_weight_top_right,
+                mut u_weight_bottom_left,
+                mut u_weight_bottom_right,
+                mut u_weight_top_left,
+                mut u_weight_top_right,
                 u_index_bottom_left,
                 u_index_bottom_right,
                 u_index_top_left,
                 u_index_top_right,
-                _u_tx,
-                _u_ty,
+                u_tx,
+                u_ty,
             ) = Apic::get_u_grid(self.width, self.height, grid_space_positions);
-
-            let u_base_x = grid_space_positions.x.floor();
-            let u_base_y = (grid_space_positions.y - half).floor();
-            let true_u_tx = true_grid_space_positions.x - u_base_x;
-            let true_u_ty = (true_grid_space_positions.y - half) - u_base_y;
 
             let (
                 u_diff_bottom_left_x,
@@ -927,26 +945,21 @@ impl Apic {
                 u_diff_top_left_y,
                 u_diff_top_right_x,
                 u_diff_top_right_y
-            ) = Apic::get_grid_distances(self.cell_size, true_u_tx, true_u_ty);
+            ) = Apic::get_grid_distances(self.cell_size, u_tx, u_ty);
             
             // V GRID
             let (
-                v_weight_bottom_left,
-                v_weight_bottom_right,
-                v_weight_top_left,
-                v_weight_top_right,
+                mut v_weight_bottom_left,
+                mut v_weight_bottom_right,
+                mut v_weight_top_left,
+                mut v_weight_top_right,
                 v_index_bottom_left,
                 v_index_bottom_right,
                 v_index_top_left,
                 v_index_top_right,
-                _v_tx,
-                _v_ty,
+                v_tx,
+                v_ty,
             ) = Apic::get_v_grid(self.width, self.height, grid_space_positions);
-
-            let v_base_x = (grid_space_positions.x - half).floor();
-            let v_base_y = grid_space_positions.y.floor();
-            let true_v_tx = (true_grid_space_positions.x - half) - v_base_x;
-            let true_v_ty = true_grid_space_positions.y - v_base_y;
 
             let (
                 v_diff_bottom_left_x,
@@ -957,9 +970,17 @@ impl Apic {
                 v_diff_top_left_y,
                 v_diff_top_right_x,
                 v_diff_top_right_y
-            ) = Apic::get_grid_distances(self.cell_size, true_v_tx, true_v_ty);
+            ) = Apic::get_grid_distances(self.cell_size, v_tx, v_ty);
 
+            u_weight_bottom_left *= w_t;
+            u_weight_bottom_right *= w_t;
+            u_weight_top_left *= w_t;
+            u_weight_top_right *= w_t;
 
+            v_weight_bottom_left *= w_t;
+            v_weight_bottom_right *= w_t;
+            v_weight_top_left *= w_t;
+            v_weight_top_right *= w_t;
             
 
             let u_add_bl = (velocities.x + c_u.x * u_diff_bottom_left_x + c_u.y * u_diff_bottom_left_y) * u_weight_bottom_left;
@@ -1685,14 +1706,21 @@ impl Apic {
         let width = self.width;
         let height = self.height;
         let cell_size = self.cell_size;
+        let timestamp = self.timestamp;
+        let border_damping = f32x8::splat(-self.world_properties.border_damping);
+        
+        let mac_grid_u = &self.mac_grid_u;
+        let mac_grid_v = &self.mac_grid_v;
         
         self.part_positions.par_iter_mut()
             .zip(self.part_velocities.par_iter_mut())
             .zip(self.part_c_u.par_iter_mut())
             .zip(self.part_c_v.par_iter_mut())
-            .for_each(|(((positions, velocity), c_u_org), c_v_org)| {
+            .zip(self.part_time_residual.par_iter_mut())
+            .enumerate()
+            .for_each(|(chunk_index, ((((positions, velocity), c_u_org), c_v_org), residual_org))| {
 
-            let grid_space_positions = *positions / f32x8::splat(self.cell_size);
+            let grid_space_positions = *positions / f32x8::splat(cell_size);
 
             // U GRID
             let (
@@ -1744,15 +1772,15 @@ impl Apic {
                 v_diff_top_right_y
             ) = Apic::get_grid_distances(cell_size, v_tx, v_ty);
 
-            let u_node_bl = gather_f32x8(&self.mac_grid_u, u_index_bottom_left);
-            let u_node_br = gather_f32x8(&self.mac_grid_u, u_index_bottom_right);
-            let u_node_tl = gather_f32x8(&self.mac_grid_u, u_index_top_left);
-            let u_node_tr = gather_f32x8(&self.mac_grid_u, u_index_top_right);
+            let u_node_bl = gather_f32x8(mac_grid_u, u_index_bottom_left);
+            let u_node_br = gather_f32x8(mac_grid_u, u_index_bottom_right);
+            let u_node_tl = gather_f32x8(mac_grid_u, u_index_top_left);
+            let u_node_tr = gather_f32x8(mac_grid_u, u_index_top_right);
 
-            let v_node_bl = gather_f32x8(&self.mac_grid_v, v_index_bottom_left);
-            let v_node_br = gather_f32x8(&self.mac_grid_v, v_index_bottom_right);
-            let v_node_tl = gather_f32x8(&self.mac_grid_v, v_index_top_left);
-            let v_node_tr = gather_f32x8(&self.mac_grid_v, v_index_top_right);
+            let v_node_bl = gather_f32x8(mac_grid_v, v_index_bottom_left);
+            let v_node_br = gather_f32x8(mac_grid_v, v_index_bottom_right);
+            let v_node_tl = gather_f32x8(mac_grid_v, v_index_top_left);
+            let v_node_tr = gather_f32x8(mac_grid_v, v_index_top_right);
 
             let u_velocity = bilinear_interpolate(
                 u_weight_bottom_left,
@@ -1777,7 +1805,23 @@ impl Apic {
             );
 
             let mut new_velocity = Vec2x8 { x: u_velocity, y: v_velocity };
-            let mut new_positions =  *positions + dt * new_velocity;
+
+            let residual = *residual_org;
+            
+            let speed = new_velocity.mag();
+            let cfl_local = speed * dt / f32x8::splat(cell_size);
+
+            let s = cfl_local.fast_max(zero).fast_min(f32x8::splat(1.0));
+            let gamma = s * s * (f32x8::splat(3.0) - f32x8::splat(2.0) * s);
+            
+            let jitter = gamma * Apic::random_simd(chunk_index, timestamp) * dt;
+            
+            let dt_raw = dt + residual + jitter;
+            let dt_act = dt_raw.fast_max(zero).fast_min(dt * f32x8::splat(2.0));
+            
+            *residual_org = dt + residual - dt_act;
+            
+            let mut new_positions = *positions + dt_act * new_velocity;
 
             let out_x_min = new_positions.x.cmp_lt(min_x);
             let out_x_max = new_positions.x.cmp_gt(max_x);
@@ -1792,15 +1836,15 @@ impl Apic {
 
             new_positions.x = out_x_min.blend(min_x, new_positions.x);
             new_positions.x = out_x_max.blend(max_x, new_positions.x);
-            new_velocity.x = out_vel_x_min.blend(new_velocity.x * f32x8::splat(-self.world_properties.border_damping), new_velocity.x);
-            new_velocity.x = out_vel_x_max.blend(new_velocity.x * f32x8::splat(-self.world_properties.border_damping), new_velocity.x);
+            new_velocity.x = out_vel_x_min.blend(new_velocity.x * border_damping, new_velocity.x);
+            new_velocity.x = out_vel_x_max.blend(new_velocity.x * border_damping, new_velocity.x);
 
             new_positions.y = out_y_min.blend(min_y, new_positions.y);
             new_positions.y = out_y_max.blend(max_y, new_positions.y);
-            new_velocity.y = out_vel_y_min.blend(new_velocity.y * f32x8::splat(-self.world_properties.border_damping), new_velocity.y);
-            new_velocity.y = out_vel_y_max.blend(new_velocity.y * f32x8::splat(-self.world_properties.border_damping), new_velocity.y);
+            new_velocity.y = out_vel_y_min.blend(new_velocity.y * border_damping, new_velocity.y);
+            new_velocity.y = out_vel_y_max.blend(new_velocity.y * border_damping, new_velocity.y);
 
-            let d_inv = f32x8::splat(4.0 / (self.cell_size * self.cell_size));
+            let d_inv = f32x8::splat(4.0 / (cell_size * cell_size));
 
             let mut c_u_x = f32x8::ZERO;
             let mut c_u_y = f32x8::ZERO;
@@ -2036,6 +2080,8 @@ impl Apic {
             self.transfer_grid_to_particles_and_advect(step_deltatime);
             
             time_simulated += step_deltatime;
+
+            self.prev_deltatime = step_deltatime;
 
             self.timestamp += 1;
         }
