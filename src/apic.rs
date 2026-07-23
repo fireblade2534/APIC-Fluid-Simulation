@@ -5,7 +5,7 @@ use rayon::{iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRe
 use ultraviolet::{Vec2, Vec2x8};
 use wide::{CmpGt, CmpLt, f32x8, i32x8, u32x8};
 
-const SAFTY: f32 = 1e-20;
+const SAFTY: f32 = 1e-5;
 
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     
@@ -26,7 +26,6 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     
     return result;
 }
-
 
 #[inline(always)]
 pub fn gather_f32x8(slice: &[f32], indices: u32x8) -> f32x8 {
@@ -243,21 +242,17 @@ impl MultiGridLevel {
                         let mut sum = *residual.get_unchecked(cell_index);
 
                         let px = *plus_x.get_unchecked(cell_index);
-                        if px != 0.0 {
-                            sum -= px * *error_ptr.add(cell_index + 1);
-                        }
-                        
+                        if px != 0.0 { sum = (-px).mul_add(*error_ptr.add(cell_index + 1), sum); }
+
                         let py = *plus_y.get_unchecked(cell_index);
-                        if py != 0.0 {
-                            sum -= py * *error_ptr.add(cell_index + width);
-                        }
+                        if py != 0.0 { sum = (-py).mul_add(*error_ptr.add(cell_index + width), sum); }
 
                         if cell_index > 0 {
-                            sum -= *plus_x.get_unchecked(cell_index - 1) * *error_ptr.add(cell_index - 1);
+                            sum = (-plus_x.get_unchecked(cell_index - 1)).mul_add(*error_ptr.add(cell_index - 1), sum);
                         }
 
                         if cell_index >= width {
-                            sum -= *plus_y.get_unchecked(cell_index - width) * *error_ptr.add(cell_index - width);
+                            sum = (-plus_y.get_unchecked(cell_index - width)).mul_add(*error_ptr.add(cell_index - width), sum);
                         }
                         
                         *error_ptr.add(cell_index) = sum * inv_diag;
@@ -373,7 +368,8 @@ impl MultiGridLevel {
 pub struct WorldProperties {
     pub gravity: f32,
     pub border_damping: f32,
-    pub cfl: f32
+    pub cfl: f32,
+    pub solve_error: f32,
 }
 
 #[derive(Default)]
@@ -413,7 +409,7 @@ pub struct Apic {
     pub search_vector: Vec<f32>,
     pub matrix_times_search: Vec<f32>,
     pub w_vector: Vec<f32>,
-    pub part_lookup: Vec<(u32, u32)>,
+    //pub part_lookup: Vec<(u32, u32)>,
 
     pub part_positions: Vec<Vec2x8>,
     pub part_velocities: Vec<Vec2x8>,
@@ -478,7 +474,7 @@ impl Apic {
         flip.part_velocities_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_c_u_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
         flip.part_c_v_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
+        //flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
         flip.part_sort.resize((flip.cells / 2) as usize, SortableTuple::new(0, 0));
         flip.num_chunks = flip.cells / 2;
 
@@ -526,7 +522,7 @@ impl Apic {
         flip.part_c_v_sort.resize(flip.num_chunks as usize, Vec2x8::zero());
         let max_dim = flip.width.max(flip.height).next_power_of_two();
         let lookup_size = (max_dim * max_dim) as usize;
-        flip.part_lookup.resize(lookup_size, (0, 0));
+        //flip.part_lookup.resize(lookup_size, (0, 0));
         flip.part_sort.resize(flip.num_particles as usize, SortableTuple::new(0, 0));
 
         for (i, pos) in initial_positions.iter().enumerate() {
@@ -680,7 +676,7 @@ impl Apic {
             }
         }
 
-        self.part_lookup.fill((u32::MAX, u32::MAX));
+        //self.part_lookup.fill((u32::MAX, u32::MAX));
         self.part_sort[..self.num_particles as usize].radix_sort_unstable();
 
         let mut position_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
@@ -688,7 +684,7 @@ impl Apic {
         let mut c_u_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
         let mut c_v_buffer: [[f32; 8]; 2] = [[0f32; 8]; 2];
 
-        let mut previous_hash: u32 = u32::MAX;
+        //let mut previous_hash: u32 = u32::MAX;
         for (index, tuple) in self.part_sort.iter().enumerate() {
 
             let hash = tuple.key;
@@ -715,6 +711,7 @@ impl Apic {
                 self.part_c_v_sort[index / 8] = Vec2x8 { x: c_v_buffer[0].into(), y: c_v_buffer[1].into() };
             }
 
+            /*
             if previous_hash != hash {
                 if previous_hash != u32::MAX {
                     self.part_lookup[previous_hash as usize].1 = index as u32;
@@ -723,11 +720,13 @@ impl Apic {
                 self.part_lookup[hash as usize].0 = index as u32;
                 previous_hash = hash;
             }
+            */
         }
-
+        /*
         if previous_hash != u32::MAX {
             self.part_lookup[previous_hash as usize].1 = self.num_particles;
         }
+        */
 
         mem::swap(&mut self.part_positions, &mut self.part_positions_sort);
         mem::swap(&mut self.part_velocities, &mut self.part_velocities_sort);
@@ -1450,12 +1449,11 @@ impl Apic {
     }
 
     #[inline(always)]
-    pub fn apply_matrix(&self, input: &[f32], output: SendPtr<f32>) {
+    pub fn apply_matrix_and_dot(&self, input: &[f32], output: SendPtr<f32>) -> f32 {
         let width = self.width as usize;
-
         let fluid_cells = &self.base_grid.fluid_indices[..self.fluid_cells as usize];
         
-        let process_cell = |&cell_index| {
+        let process_cell = |&cell_index| -> f32 {
             let index = cell_index as usize;
             unsafe {
                 let mut value = *self.base_grid.diag_laplacian.get_unchecked(index) * *input.get_unchecked(index);
@@ -1477,14 +1475,16 @@ impl Apic {
                 }
                 
                 *output.add(index) = value;
+                
+                return value * *input.get_unchecked(index) 
             }
         };
 
-        if fluid_cells.len() > 4096 {
-            fluid_cells.par_iter().with_min_len(4096).for_each(process_cell);
+        return if fluid_cells.len() > 4096 {
+            fluid_cells.par_iter().with_min_len(4096).map(process_cell).sum()
         } else {
-            fluid_cells.iter().for_each(process_cell);
-        }
+            fluid_cells.iter().map(process_cell).sum()
+        };
     }
     
     pub fn solve_pcg(&mut self) {
@@ -1519,9 +1519,8 @@ impl Apic {
         let matrix_ptr = SendPtr(self.matrix_times_search.as_mut_ptr());
 
         for _ in 0..max_iterations {
-            self.apply_matrix(&self.search_vector, matrix_ptr);
 
-            let delta = dot_product(&self.search_vector, &self.matrix_times_search);
+            let delta = self.apply_matrix_and_dot(&self.search_vector, matrix_ptr);
 
             if delta.abs() < SAFTY {
                 break;
@@ -1535,7 +1534,7 @@ impl Apic {
                 unsafe {
                     *pressure_ptr.add(index) += alpha * *search_ptr.add(index);
 
-                    let new_residual = *residual_ptr.add(index) - (alpha * *matrix_ptr.add(index));
+                    let new_residual = (-alpha).mul_add(*matrix_ptr.add(index), *residual_ptr.add(index));
 
                     *residual_ptr.add(index) = new_residual;
 
@@ -1549,7 +1548,7 @@ impl Apic {
                 max_error = self.base_grid.fluid_indices[..self.fluid_cells as usize].iter().map(max_error_process).fold(0.0, |a, b| a.max(b));
             }
 
-            if max_error < 1e-8 {
+            if max_error < self.world_properties.solve_error {
                 break;
             }
 

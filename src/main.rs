@@ -38,7 +38,8 @@ async fn main() {
     let world_properties = WorldProperties {
         gravity: -9.8,
         border_damping: 0.5,
-        cfl: 5.0
+        cfl: 5.0,
+        solve_error: 1e-5,
     };
 
     let mut simulation = Apic::new(

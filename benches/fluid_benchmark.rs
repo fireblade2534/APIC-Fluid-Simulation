@@ -18,6 +18,7 @@ fn bench_fluid_update(c: &mut Criterion) {
                     gravity: -9.81,
                     border_damping: 0.1,
                     cfl: 5.0,
+                    solve_error: 1e-5,
                 };
                 
                 // Initialize the fluid simulation
