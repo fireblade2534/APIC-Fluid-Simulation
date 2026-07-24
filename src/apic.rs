@@ -331,16 +331,16 @@ impl MultiGridLevel {
                     self.black_indices.par_chunks(chunk_size).for_each(process_chunk);
                     self.red_indices.par_chunks(chunk_size).for_each(process_chunk);
                 } else {
-                    self.black_indices.chunks(chunk_size).for_each(process_chunk);
-                    self.red_indices.chunks(chunk_size).for_each(process_chunk);
+                    process_chunk(&self.black_indices);
+                    process_chunk(&self.red_indices);
                 }
             } else {
                 if use_parallel {
                     self.red_indices.par_chunks(chunk_size).for_each(process_chunk);
                     self.black_indices.par_chunks(chunk_size).for_each(process_chunk);
                 } else {
-                    self.red_indices.chunks(chunk_size).for_each(process_chunk);
-                    self.black_indices.chunks(chunk_size).for_each(process_chunk);
+                    process_chunk(&self.red_indices);
+                    process_chunk(&self.black_indices);
                 }
             }
         }
@@ -1121,28 +1121,32 @@ impl Apic {
             }
         });
 
-
-        self.mac_u.par_iter_mut()
-            .zip(self.mac_weight_u.par_iter())
-            .zip(self.mac_valid_u.par_iter_mut())
-            .with_min_len(4096)
-            .for_each(|((u, w), v)| {
-                if *w > 0.0 {
-                    *v = true;
-                    *u /= *w;
-                }
-            });
-
-        self.mac_v.par_iter_mut()
-            .zip(self.mac_weight_v.par_iter())
-            .zip(self.mac_valid_v.par_iter_mut())
-            .with_min_len(4096)
-            .for_each(|((u, w), v)| {
-                if *w > 0.0 {
-                    *v = true;
-                    *u /= *w;
-                }
-            });
+        rayon::join(
+            || {
+            self.mac_u.par_iter_mut()
+                .zip(self.mac_weight_u.par_iter())
+                .zip(self.mac_valid_u.par_iter_mut())
+                .with_min_len(4096)
+                .for_each(|((u, w), v)| {
+                    if *w > 0.0 {
+                        *v = true;
+                        *u /= *w;
+                    }
+                });
+            },
+            || {
+            self.mac_v.par_iter_mut()
+                .zip(self.mac_weight_v.par_iter())
+                .zip(self.mac_valid_v.par_iter_mut())
+                .with_min_len(4096)
+                .for_each(|((u, w), v)| {
+                    if *w > 0.0 {
+                        *v = true;
+                        *u /= *w;
+                    }
+                });
+            }
+        );
 
         self.fluid_cells = 0;
 
@@ -1640,91 +1644,94 @@ impl Apic {
         let grid_u_ptr = SendPtr(self.mac_u.as_mut_ptr());
         let valid_u_ptr = SendPtr(self.mac_valid_u.as_mut_ptr() as *mut u8);
 
-        (0..self.height as i32).into_par_iter().for_each(|y| {
-            for x in 0..=self.width as i32 {
-                let face_index = self.u_index(x, y) as usize;
-
-                let left_cell_x = x - 1;
-
-                let left_is_obstacle = self.is_obstacle(left_cell_x, y) == 1;
-                let right_is_obstacle = self.is_obstacle(x, y) == 1;
-
-                if left_is_obstacle != right_is_obstacle {
-                    unsafe {
-                        *grid_u_ptr.add(face_index) = 0.0;
-                        *valid_u_ptr.add(face_index) = 1;
-                    }
-                    continue;
-                }
-
-                let left_is_fluid = self.is_fluid(left_cell_x, y) == 1;
-                let right_is_fluid = self.is_fluid(x, y) == 1;
-                
-                let mut pressure_difference = 0.0;
-                
-                let left_cell_index = ((y * self.width as i32) + left_cell_x) as usize;
-                let right_cell_index = ((y * self.width as i32) + x) as usize;
-
-                if left_is_fluid && right_is_fluid {
-                    pressure_difference = self.mac_pressure_grid[right_cell_index] - self.mac_pressure_grid[left_cell_index];
-                } else if left_is_fluid {
-                    let theta = self.calculate_theta(self.smoothed_density[right_cell_index], self.smoothed_density[left_cell_index], target_density);
-                    pressure_difference = -self.mac_pressure_grid[left_cell_index] / theta;
-                } else if right_is_fluid {
-                    let theta = self.calculate_theta(self.smoothed_density[left_cell_index], self.smoothed_density[right_cell_index], target_density);
-                    pressure_difference = self.mac_pressure_grid[right_cell_index] / theta;
-                }
-
-                unsafe {
-                    *grid_u_ptr.add(face_index) -= pressure_difference * inv_cell_size;
-                }
-
-            }
-        });
-
         let grid_v_ptr = SendPtr(self.mac_v.as_mut_ptr());
         let valid_v_ptr = SendPtr(self.mac_valid_v.as_mut_ptr() as *mut u8);
-        
-        (0..=self.height as i32).into_par_iter().for_each(|y| {
-            for x in 0..self.width as i32 {
 
-                let face_index = self.v_index(x, y) as usize;
+        rayon::join(
+            || {
+            (0..self.height as i32).into_par_iter().with_min_len(32).for_each(|y| {
+                for x in 0..=self.width as i32 {
+                    let face_index = self.u_index(x, y) as usize;
 
-                let bottom_cell_y = y - 1;
+                    let left_cell_x = x - 1;
 
-                let bottom_is_obstacle = self.is_obstacle(x, bottom_cell_y) == 1;
-                let top_is_obstacle = self.is_obstacle(x, y) == 1;
+                    let left_is_obstacle = self.is_obstacle(left_cell_x, y) == 1;
+                    let right_is_obstacle = self.is_obstacle(x, y) == 1;
 
-                if bottom_is_obstacle != top_is_obstacle {
-                    unsafe {
-                        *grid_v_ptr.add(face_index) = 0.0;
-                        *valid_v_ptr.add(face_index) = 1;
+                    if left_is_obstacle != right_is_obstacle {
+                        unsafe {
+                            *grid_u_ptr.add(face_index) = 0.0;
+                            *valid_u_ptr.add(face_index) = 1;
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                let bottom_is_fluid = self.is_fluid(x, bottom_cell_y) == 1;
-                let top_is_fluid = self.is_fluid(x, y) == 1;
-                
-                let mut pressure_difference = 0.0;
-                
-                let bottom_cell_index = ((bottom_cell_y * self.width as i32) + x) as usize;
-                let top_cell_index = ((y * self.width as i32) + x) as usize;
+                    let left_is_fluid = self.is_fluid(left_cell_x, y) == 1;
+                    let right_is_fluid = self.is_fluid(x, y) == 1;
+                    
+                    let mut pressure_difference = 0.0;
+                    
+                    let left_cell_index = ((y * self.width as i32) + left_cell_x) as usize;
+                    let right_cell_index = ((y * self.width as i32) + x) as usize;
 
-                if bottom_is_fluid && top_is_fluid {
-                    pressure_difference = self.mac_pressure_grid[top_cell_index] - self.mac_pressure_grid[bottom_cell_index];
-                } else if bottom_is_fluid {
-                    let theta = self.calculate_theta(self.smoothed_density[top_cell_index], self.smoothed_density[bottom_cell_index], target_density);
-                    pressure_difference = -self.mac_pressure_grid[bottom_cell_index] / theta;
-                } else if top_is_fluid {
-                    let theta = self.calculate_theta(self.smoothed_density[bottom_cell_index], self.smoothed_density[top_cell_index], target_density);
-                    pressure_difference = self.mac_pressure_grid[top_cell_index] / theta;
-                }
+                    if left_is_fluid && right_is_fluid {
+                        pressure_difference = self.mac_pressure_grid[right_cell_index] - self.mac_pressure_grid[left_cell_index];
+                    } else if left_is_fluid {
+                        let theta = self.calculate_theta(self.smoothed_density[right_cell_index], self.smoothed_density[left_cell_index], target_density);
+                        pressure_difference = -self.mac_pressure_grid[left_cell_index] / theta;
+                    } else if right_is_fluid {
+                        let theta = self.calculate_theta(self.smoothed_density[left_cell_index], self.smoothed_density[right_cell_index], target_density);
+                        pressure_difference = self.mac_pressure_grid[right_cell_index] / theta;
+                    }
 
-                unsafe {
-                    *grid_v_ptr.add(face_index) -= pressure_difference * inv_cell_size;
+                    unsafe {
+                        *grid_u_ptr.add(face_index) -= pressure_difference * inv_cell_size;
+                    }
+
                 }
-            }
+            });
+            },|| {        
+            (0..self.height as i32 + 1).into_par_iter().with_min_len(32).for_each(|y| {
+                for x in 0..self.width as i32 {
+
+                    let face_index = self.v_index(x, y) as usize;
+
+                    let bottom_cell_y = y - 1;
+
+                    let bottom_is_obstacle = self.is_obstacle(x, bottom_cell_y) == 1;
+                    let top_is_obstacle = self.is_obstacle(x, y) == 1;
+
+                    if bottom_is_obstacle != top_is_obstacle {
+                        unsafe {
+                            *grid_v_ptr.add(face_index) = 0.0;
+                            *valid_v_ptr.add(face_index) = 1;
+                        }
+                        continue;
+                    }
+
+                    let bottom_is_fluid = self.is_fluid(x, bottom_cell_y) == 1;
+                    let top_is_fluid = self.is_fluid(x, y) == 1;
+                    
+                    let mut pressure_difference = 0.0;
+                    
+                    let bottom_cell_index = ((bottom_cell_y * self.width as i32) + x) as usize;
+                    let top_cell_index = ((y * self.width as i32) + x) as usize;
+
+                    if bottom_is_fluid && top_is_fluid {
+                        pressure_difference = self.mac_pressure_grid[top_cell_index] - self.mac_pressure_grid[bottom_cell_index];
+                    } else if bottom_is_fluid {
+                        let theta = self.calculate_theta(self.smoothed_density[top_cell_index], self.smoothed_density[bottom_cell_index], target_density);
+                        pressure_difference = -self.mac_pressure_grid[bottom_cell_index] / theta;
+                    } else if top_is_fluid {
+                        let theta = self.calculate_theta(self.smoothed_density[bottom_cell_index], self.smoothed_density[top_cell_index], target_density);
+                        pressure_difference = self.mac_pressure_grid[top_cell_index] / theta;
+                    }
+
+                    unsafe {
+                        *grid_v_ptr.add(face_index) -= pressure_difference * inv_cell_size;
+                    }
+                }
+            });
         });
     }
 
@@ -1927,80 +1934,85 @@ impl Apic {
         let width = self.width as usize;
         let height = self.height as usize;
 
-        for _ in 0..4 {
-            std::mem::swap(&mut self.mac_u, &mut self.old_grid_u);
-            std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
+        rayon::join(
+            || {
+            for _ in 0..4 {
+                std::mem::swap(&mut self.mac_u, &mut self.old_grid_u);
+                std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
 
-            let old_grid_u = &self.old_grid_u;
-            let next_valid_u = &self.next_valid_u;
+                let old_grid_u = &self.old_grid_u;
+                let next_valid_u = &self.next_valid_u;
 
-            self.mac_u.par_iter_mut()
-                .zip(self.mac_valid_u.par_iter_mut())
-                .enumerate()
-                .with_min_len(512)
-                .for_each(|(index, (u, valid))| {
-                if next_valid_u[index] {
-                    *u = old_grid_u[index];
-                    *valid = true;
-                } else {
-                    let mut sum: f32 = 0.0;
-                    let mut count: u32 = 0;
-                    let x = index % (width + 1);
-                    let y = index / (width + 1);
-
-                    if x > 0 && next_valid_u[index - 1] { sum += old_grid_u[index - 1]; count += 1; }
-                    if x < width && next_valid_u[index + 1] { sum += old_grid_u[index + 1]; count += 1; }
-                    if y > 0 && next_valid_u[index - (width + 1)] { sum += old_grid_u[index - (width + 1)]; count += 1; }
-                    if y < height - 1 && next_valid_u[index + width + 1] { sum += old_grid_u[index + width + 1]; count += 1; }
-
-                    if count > 0 {
-                        *u = sum / (count as f32);
-                        *valid = true;
-                    } else {
+                self.mac_u.par_iter_mut()
+                    .zip(self.mac_valid_u.par_iter_mut())
+                    .enumerate()
+                    .with_min_len(512)
+                    .for_each(|(index, (u, valid))| {
+                    if next_valid_u[index] {
                         *u = old_grid_u[index];
-                        *valid = false;
-                    }
-                }
-            });
-        }
-            
-            
-        for _ in 0..4 {
-            std::mem::swap(&mut self.mac_v, &mut self.old_grid_v);
-            std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
-
-            let old_grid_v = &self.old_grid_v;
-            let next_valid_v = &self.next_valid_v;
-
-            self.mac_v.par_iter_mut()
-                .zip(self.mac_valid_v.par_iter_mut())
-                .enumerate()
-                .with_min_len(512)
-                .for_each(|(index, (v, valid))| {
-                if next_valid_v[index] {
-                    *v = old_grid_v[index];
-                    *valid = true;
-                } else {
-                    let mut sum: f32 = 0.0;
-                    let mut count: u32 = 0;
-                    let x = index % width;
-                    let y = index / width;
-
-                    if x > 0 && next_valid_v[index - 1] { sum += old_grid_v[index - 1]; count += 1; }
-                    if x < width - 1 && next_valid_v[index + 1] { sum += old_grid_v[index + 1]; count += 1; }
-                    if y > 0 && next_valid_v[index - width] { sum += old_grid_v[index - width]; count += 1; }
-                    if y < height && next_valid_v[index + width] { sum += old_grid_v[index + width]; count += 1; }
-
-                    if count > 0 {
-                        *v = sum / (count as f32);
                         *valid = true;
                     } else {
-                        *v = old_grid_v[index];
-                        *valid = false;
+                        let mut sum: f32 = 0.0;
+                        let mut count: u32 = 0;
+                        let x = index % (width + 1);
+                        let y = index / (width + 1);
+
+                        if x > 0 && next_valid_u[index - 1] { sum += old_grid_u[index - 1]; count += 1; }
+                        if x < width && next_valid_u[index + 1] { sum += old_grid_u[index + 1]; count += 1; }
+                        if y > 0 && next_valid_u[index - (width + 1)] { sum += old_grid_u[index - (width + 1)]; count += 1; }
+                        if y < height - 1 && next_valid_u[index + width + 1] { sum += old_grid_u[index + width + 1]; count += 1; }
+
+                        if count > 0 {
+                            *u = sum / (count as f32);
+                            *valid = true;
+                        } else {
+                            *u = old_grid_u[index];
+                            *valid = false;
+                        }
                     }
-                }
-            });
-        }
+                });
+            }
+            },
+            || {
+            
+            
+            for _ in 0..4 {
+                std::mem::swap(&mut self.mac_v, &mut self.old_grid_v);
+                std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
+
+                let old_grid_v = &self.old_grid_v;
+                let next_valid_v = &self.next_valid_v;
+
+                self.mac_v.par_iter_mut()
+                    .zip(self.mac_valid_v.par_iter_mut())
+                    .enumerate()
+                    .with_min_len(512)
+                    .for_each(|(index, (v, valid))| {
+                    if next_valid_v[index] {
+                        *v = old_grid_v[index];
+                        *valid = true;
+                    } else {
+                        let mut sum: f32 = 0.0;
+                        let mut count: u32 = 0;
+                        let x = index % width;
+                        let y = index / width;
+
+                        if x > 0 && next_valid_v[index - 1] { sum += old_grid_v[index - 1]; count += 1; }
+                        if x < width - 1 && next_valid_v[index + 1] { sum += old_grid_v[index + 1]; count += 1; }
+                        if y > 0 && next_valid_v[index - width] { sum += old_grid_v[index - width]; count += 1; }
+                        if y < height && next_valid_v[index + width] { sum += old_grid_v[index + width]; count += 1; }
+
+                        if count > 0 {
+                            *v = sum / (count as f32);
+                            *valid = true;
+                        } else {
+                            *v = old_grid_v[index];
+                            *valid = false;
+                        }
+                    }
+                });
+            }
+        });
 
     }
 
