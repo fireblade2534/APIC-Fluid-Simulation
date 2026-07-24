@@ -1,4 +1,4 @@
-use std::{cell, mem};
+use std::{cell, mem, sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed}};
 use rdst::{RadixKey, RadixSort};
 
 use rayon::{iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator}, slice::{ParallelSlice, ParallelSliceMut}};
@@ -131,6 +131,7 @@ pub fn bilinear_interpolate(
     return velocity;
 }
 
+
 #[inline(always)]
 pub fn expand_bits(mut v: u32x8) -> u32x8 {
     v = v & u32x8::splat(0x0000FFFF);
@@ -180,6 +181,49 @@ impl<T> SendPtr<T> {
     pub unsafe fn add(self, count: usize) -> *mut T {
         unsafe {
             self.0.add(count)
+        }
+    }
+}
+
+#[inline(always)]
+pub fn as_atomic_u32_slice(slice: &mut [f32]) -> &[AtomicU32] {
+    unsafe {
+        std::slice::from_raw_parts(
+            slice.as_ptr() as *const AtomicU32,
+            slice.len()
+        )
+    }
+}
+
+#[inline(always)]
+pub fn as_atomic_u64_slice(slice: &mut [u64]) -> &[AtomicU64] {
+    unsafe {
+        std::slice::from_raw_parts(
+            slice.as_ptr() as *const AtomicU64,
+            slice.len()
+        )
+    }
+}
+
+#[inline(always)]
+pub fn atomic_add_f32(atomic: &AtomicU32, value: f32) {
+    if value == 0.0 {
+        return;
+    }
+
+    let mut current = atomic.load(Relaxed);
+    loop {
+        let new_value = f32::from_bits(current) + value;
+        match atomic.compare_exchange_weak(current,
+            new_value.to_bits(),
+            Relaxed,
+            Relaxed
+        ) {
+            Ok(_) => return,
+            Err(actual) => {
+                std::hint::spin_loop();
+                current = actual;
+            },
         }
     }
 }
@@ -381,23 +425,6 @@ impl MultiGridLevel {
     }
 }
 
-#[derive(Default)]
-pub struct LocalGrid {
-    pub mac_u: Vec<f32>,
-    pub mac_v: Vec<f32>,
-    pub mac_weight_u: Vec<f32>,
-    pub mac_weight_v: Vec<f32>,
-    pub mac_density: Vec<f32>,
-    pub type_fluid: Vec<u64>,
-
-    pub min_index_u: usize,
-    pub min_index_v: usize,
-    pub min_index_grid: usize,
-    pub max_index_u: usize,
-    pub max_index_v: usize,
-    pub max_index_grid: usize,
-}
-
 #[derive(Default, Clone)]
 pub struct WorldProperties {
     pub gravity: f32,
@@ -421,8 +448,6 @@ pub struct Apic {
     pub post_force_u: Vec<f32>,
     pub post_force_v: Vec<f32>,
 
-    pub local_grids: Vec<LocalGrid>,
-
     pub smoothed_density: Vec<f32>,
     pub old_density: Vec<f32>,
 
@@ -431,6 +456,12 @@ pub struct Apic {
 
     pub mac_valid_u: Vec<bool>,
     pub mac_valid_v: Vec<bool>,
+
+    pub mac_u: Vec<f32>,
+    pub mac_v: Vec<f32>,
+    pub mac_weight_u: Vec<f32>,
+    pub mac_weight_v: Vec<f32>,
+    pub mac_density: Vec<f32>,
 
     pub old_grid_u: Vec<f32>,
     pub old_grid_v: Vec<f32>,
@@ -488,42 +519,20 @@ impl Apic {
         flip.next_valid_u.resize((flip.cells + flip.height) as usize, false);
         flip.next_valid_v.resize((flip.cells + flip.width) as usize, false);
 
+        flip.mac_u.resize((flip.cells + flip.height) as usize, 0.0);
+        flip.mac_v.resize((flip.cells + flip.width) as usize, 0.0);
+        flip.mac_weight_u.resize((flip.cells + flip.height) as usize, 0.0);
+        flip.mac_weight_v.resize((flip.cells + flip.width) as usize, 0.0);
+        flip.mac_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+
         flip.smoothed_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.old_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
-
-        for _ in 0..rayon::current_num_threads().max(1) {
-            flip.local_grids.push(LocalGrid {
-                mac_u: vec![0.0; (flip.cells + flip.height) as usize],
-                mac_v: vec![0.0; (flip.cells + flip.width) as usize],
-                mac_weight_u: vec![0.0; (flip.cells + flip.height) as usize],
-                mac_weight_v: vec![0.0; (flip.cells + flip.width) as usize],
-                mac_density: vec![0.0; (flip.cells.div_ceil(8) * 8) as usize],
-                type_fluid: vec![0; flip.base_grid.type_fluid.len()],
-
-                min_index_u: 0,
-                min_index_v: 0,
-                min_index_grid: 0,
-                max_index_u: (flip.cells + flip.height) as usize,
-                max_index_v: (flip.cells + flip.width) as usize,
-                max_index_grid: flip.cells as usize,
-            });
-        }
-
 
         flip.search_vector.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.matrix_times_search.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.w_vector.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
 
-        flip.part_positions.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_velocities.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_c_u.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_c_v.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_positions_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_velocities_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_c_u_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
-        flip.part_c_v_sort.resize((flip.cells / 2) as usize, Vec2x8::zero());
         //flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
-        flip.part_sort.resize((flip.cells / 2) as usize, SortableTuple::new(0, 0));
         flip.num_chunks = flip.cells / 2;
 
         flip.prev_deltatime = 1.0 / 60.0;
@@ -872,303 +881,249 @@ impl Apic {
         );
     }
 
-    #[inline(always)]
-    fn get_main_grid(&self) -> &LocalGrid{
-        unsafe {
-            self.local_grids.get_unchecked(0)
-        }
-    }
-
-    #[inline(always)]
-    fn get_main_grid_mut(&mut self) -> &mut LocalGrid{
-        unsafe {
-            self.local_grids.get_unchecked_mut(0)
-        }
-    }
-
     pub fn transfer_particles_to_grid(&mut self, deltatime: f32, timestamp: u32) {
         self.base_grid.type_fluid.fill(0);
         self.base_grid.red_indices.clear();
         self.base_grid.black_indices.clear();
         self.base_grid.fluid_indices.clear();
+        self.mac_u.fill(0.0);
+        self.mac_v.fill(0.0);
+        self.mac_weight_u.fill(0.0);
+        self.mac_weight_v.fill(0.0);
+        self.mac_density.fill(0.0);
 
         self.mac_valid_u.fill(false);
         self.mac_valid_v.fill(false);
 
-        let num_threads = rayon::current_num_threads().max(1);
-        let chunk_size = (self.num_chunks as usize).div_ceil(num_threads);
+        let atomic_u = as_atomic_u32_slice(&mut self.mac_u);
+        let atomic_v = as_atomic_u32_slice(&mut self.mac_v);
+        let atomic_wu = as_atomic_u32_slice(&mut self.mac_weight_u);
+        let atomic_wv = as_atomic_u32_slice(&mut self.mac_weight_v);
+        let atomic_density = as_atomic_u32_slice(&mut self.mac_density);
+        let atomic_type_fluid = as_atomic_u64_slice(&mut self.base_grid.type_fluid);
 
-        self.local_grids.par_iter_mut().enumerate().for_each(|(thread_index, local_grid)| {
+        (0..self.num_chunks as usize)
+            .into_par_iter()
+            .with_min_len(256)
+            .for_each(|chunk_index| {
 
-            local_grid.mac_u.fill(0.0);
-            local_grid.mac_v.fill(0.0);
-            local_grid.mac_weight_u.fill(0.0);
-            local_grid.mac_weight_v.fill(0.0);
-            local_grid.mac_density.fill(0.0);
-            local_grid.type_fluid.fill(0);
-            local_grid.min_index_u = (self.cells + self.height) as usize;
-            local_grid.min_index_v = (self.cells + self.width) as usize;
-            local_grid.min_index_grid = self.cells as usize;
-            local_grid.max_index_u = 0;
-            local_grid.max_index_v = 0;
-            local_grid.max_index_grid = 0;
+            let raw_positions = self.part_positions[chunk_index];
+            let velocities = self.part_velocities[chunk_index];
 
-            let start = thread_index * chunk_size;
-            let end = (start + chunk_size).min(self.num_chunks as usize);
-            if start >= end { return; }
-
-            for chunk_index in start..end {
-
-                let raw_positions = self.part_positions[chunk_index];
-                let velocities = self.part_velocities[chunk_index];
-
-                let positions = raw_positions;
-                let prev_dt = f32x8::splat(self.prev_deltatime);
-                let tau = -self.part_time_residual[chunk_index] / prev_dt;
-                let w_t = temporal_kernel_w_t(tau);
+            let positions = raw_positions;
+            let prev_dt = f32x8::splat(self.prev_deltatime);
+            let tau = -self.part_time_residual[chunk_index] / prev_dt;
+            let w_t = temporal_kernel_w_t(tau);
 
 
-                let c_u = self.part_c_u[chunk_index];
-                let c_v = self.part_c_v[chunk_index];
+            let c_u = self.part_c_u[chunk_index];
+            let c_v = self.part_c_v[chunk_index];
 
-                let grid_space_positions = positions / f32x8::splat(self.cell_size);
-                let true_grid_space_positions = raw_positions / f32x8::splat(self.cell_size); 
+            let grid_space_positions = positions / f32x8::splat(self.cell_size);
+            let true_grid_space_positions = raw_positions / f32x8::splat(self.cell_size); 
 
-                let half = f32x8::splat(0.5);
-                let one = f32x8::splat(1.0);
-                
-                let c_grid_x = true_grid_space_positions.x - half;
-                let c_grid_y = true_grid_space_positions.y - half;
-                
-                let c_base_x = c_grid_x.floor();
-                let c_base_y = c_grid_y.floor();
-                let c_tx = c_grid_x - c_base_x;
-                let c_ty = c_grid_y - c_base_y;
-                
-                let c_weight_back_left = ((one - c_tx) * (one - c_ty)) * w_t;
-                let c_weight_back_right = (c_tx * (one - c_ty)) * w_t;
-                let c_weight_top_left = ((one - c_tx) * c_ty) * w_t;
-                let c_weight_top_right = (c_tx * c_ty) * w_t;
-
-                let max_x = i32x8::splat(self.width as i32 - 1);
-                let max_y = i32x8::splat(self.height as i32 - 1);
-                let cx0 = c_base_x.fast_trunc_int().min(max_x).max(i32x8::ZERO);
-                let cx1 = (c_base_x.fast_trunc_int() + i32x8::splat(1)).min(max_x).max(i32x8::ZERO);
-                let cy0 = c_base_y.fast_trunc_int().min(max_y).max(i32x8::ZERO);
-                let cy1 = (c_base_y.fast_trunc_int() + i32x8::splat(1)).min(max_y).max(i32x8::ZERO);
-
-                let width_splat = i32x8::splat(self.width as i32);
-                let c_index_back_left: u32x8 = bytemuck::cast(cy0 * width_splat + cx0);
-                let c_index_back_right: u32x8 = bytemuck::cast(cy0 * width_splat + cx1);
-                let c_index_top_left: u32x8 = bytemuck::cast(cy1 * width_splat + cx0);
-                let c_index_top_right: u32x8 = bytemuck::cast(cy1 * width_splat + cx1);
-
-                // U GRID
-                let (
-                    mut u_weight_bottom_left,
-                    mut u_weight_bottom_right,
-                    mut u_weight_top_left,
-                    mut u_weight_top_right,
-                    u_index_bottom_left,
-                    u_index_bottom_right,
-                    u_index_top_left,
-                    u_index_top_right,
-                    u_tx,
-                    u_ty,
-                ) = Apic::get_u_grid(self.width, self.height, grid_space_positions);
-
-                let (
-                    u_diff_bottom_left_x,
-                    u_diff_bottom_left_y,
-                    u_diff_bottom_right_x,
-                    u_diff_bottom_right_y,
-                    u_diff_top_left_x,
-                    u_diff_top_left_y,
-                    u_diff_top_right_x,
-                    u_diff_top_right_y
-                ) = Apic::get_grid_distances(self.cell_size, u_tx, u_ty);
-                
-                // V GRID
-                let (
-                    mut v_weight_bottom_left,
-                    mut v_weight_bottom_right,
-                    mut v_weight_top_left,
-                    mut v_weight_top_right,
-                    v_index_bottom_left,
-                    v_index_bottom_right,
-                    v_index_top_left,
-                    v_index_top_right,
-                    v_tx,
-                    v_ty,
-                ) = Apic::get_v_grid(self.width, self.height, grid_space_positions);
-
-                let (
-                    v_diff_bottom_left_x,
-                    v_diff_bottom_left_y,
-                    v_diff_bottom_right_x,
-                    v_diff_bottom_right_y,
-                    v_diff_top_left_x,
-                    v_diff_top_left_y,
-                    v_diff_top_right_x,
-                    v_diff_top_right_y
-                ) = Apic::get_grid_distances(self.cell_size, v_tx, v_ty);
-
-                u_weight_bottom_left *= w_t;
-                u_weight_bottom_right *= w_t;
-                u_weight_top_left *= w_t;
-                u_weight_top_right *= w_t;
-
-                v_weight_bottom_left *= w_t;
-                v_weight_bottom_right *= w_t;
-                v_weight_top_left *= w_t;
-                v_weight_top_right *= w_t;
-                
-
-                let u_add_bl = (velocities.x + c_u.x * u_diff_bottom_left_x + c_u.y * u_diff_bottom_left_y) * u_weight_bottom_left;
-                let u_add_br = (velocities.x + c_u.x * u_diff_bottom_right_x + c_u.y * u_diff_bottom_right_y) * u_weight_bottom_right;
-                let u_add_tl = (velocities.x + c_u.x * u_diff_top_left_x + c_u.y * u_diff_top_left_y) * u_weight_top_left;
-                let u_add_tr = (velocities.x + c_u.x * u_diff_top_right_x + c_u.y * u_diff_top_right_y) * u_weight_top_right;
-
-                let v_add_bl = (velocities.y + c_v.x * v_diff_bottom_left_x + c_v.y * v_diff_bottom_left_y) * v_weight_bottom_left;
-                let v_add_br = (velocities.y + c_v.x * v_diff_bottom_right_x + c_v.y * v_diff_bottom_right_y) * v_weight_bottom_right;
-                let v_add_tl = (velocities.y + c_v.x * v_diff_top_left_x + c_v.y * v_diff_top_left_y) * v_weight_top_left;
-                let v_add_tr = (velocities.y + c_v.x * v_diff_top_right_x + c_v.y * v_diff_top_right_y) * v_weight_top_right;
-
+            let half = f32x8::splat(0.5);
+            let one = f32x8::splat(1.0);
             
-                let clamped_x = grid_space_positions.x.min(f32x8::splat(self.width as f32 - 1.0)).max(f32x8::ZERO);
-                let clamped_y = grid_space_positions.y.min(f32x8::splat(self.height as f32 - 1.0)).max(f32x8::ZERO);
-                let grid_fluid_indexes: u32x8 = bytemuck::cast((clamped_y.fast_trunc_int() * (self.width as i32)) + clamped_x.fast_trunc_int());
+            let c_grid_x = true_grid_space_positions.x - half;
+            let c_grid_y = true_grid_space_positions.y - half;
+            
+            let c_base_x = c_grid_x.floor();
+            let c_base_y = c_grid_y.floor();
+            let c_tx = c_grid_x - c_base_x;
+            let c_ty = c_grid_y - c_base_y;
+            
+            let c_weight_back_left = ((one - c_tx) * (one - c_ty)) * w_t;
+            let c_weight_back_right = (c_tx * (one - c_ty)) * w_t;
+            let c_weight_top_left = ((one - c_tx) * c_ty) * w_t;
+            let c_weight_top_right = (c_tx * c_ty) * w_t;
 
-                let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
-                    self.num_particles % 8
-                } else {
-                    8
-                };
+            let max_x = i32x8::splat(self.width as i32 - 1);
+            let max_y = i32x8::splat(self.height as i32 - 1);
+            let cx0 = c_base_x.fast_trunc_int().min(max_x).max(i32x8::ZERO);
+            let cx1 = (c_base_x.fast_trunc_int() + i32x8::splat(1)).min(max_x).max(i32x8::ZERO);
+            let cy0 = c_base_y.fast_trunc_int().min(max_y).max(i32x8::ZERO);
+            let cy1 = (c_base_y.fast_trunc_int() + i32x8::splat(1)).min(max_y).max(i32x8::ZERO);
 
-                let u_add_back_left_arr = u_add_bl.as_array_ref();
-                let u_add_back_right_arr = u_add_br.as_array_ref();
-                let u_add_top_left_arr = u_add_tl.as_array_ref();
-                let u_add_top_right_arr = u_add_tr.as_array_ref();
-                let u_wt_back_left_arr = u_weight_bottom_left.as_array_ref();
-                let u_wt_back_right_arr = u_weight_bottom_right.as_array_ref();
-                let u_wt_top_left_arr = u_weight_top_left.as_array_ref();
-                let u_wt_top_right_arr = u_weight_top_right.as_array_ref();
+            let width_splat = i32x8::splat(self.width as i32);
+            let c_index_back_left: u32x8 = bytemuck::cast(cy0 * width_splat + cx0);
+            let c_index_back_right: u32x8 = bytemuck::cast(cy0 * width_splat + cx1);
+            let c_index_top_left: u32x8 = bytemuck::cast(cy1 * width_splat + cx0);
+            let c_index_top_right: u32x8 = bytemuck::cast(cy1 * width_splat + cx1);
 
-                let v_add_back_left_arr = v_add_bl.as_array_ref();
-                let v_add_back_right_arr = v_add_br.as_array_ref();
-                let v_add_top_left_arr = v_add_tl.as_array_ref();
-                let v_add_top_right_arr = v_add_tr.as_array_ref();
-                let v_wt_back_left_arr = v_weight_bottom_left.as_array_ref();
-                let v_wt_back_right_arr = v_weight_bottom_right.as_array_ref();
-                let v_wt_top_left_arr = v_weight_top_left.as_array_ref();
-                let v_wt_top_right_arr = v_weight_top_right.as_array_ref();
+            // U GRID
+            let (
+                mut u_weight_bottom_left,
+                mut u_weight_bottom_right,
+                mut u_weight_top_left,
+                mut u_weight_top_right,
+                u_index_bottom_left,
+                u_index_bottom_right,
+                u_index_top_left,
+                u_index_top_right,
+                u_tx,
+                u_ty,
+            ) = Apic::get_u_grid(self.width, self.height, grid_space_positions);
 
-                let c_wt_back_left_arr = c_weight_back_left.as_array_ref();
-                let c_wt_back_right_arr = c_weight_back_right.as_array_ref();
-                let c_wt_top_left_arr = c_weight_top_left.as_array_ref();
-                let c_wt_top_right_arr = c_weight_top_right.as_array_ref();
+            let (
+                u_diff_bottom_left_x,
+                u_diff_bottom_left_y,
+                u_diff_bottom_right_x,
+                u_diff_bottom_right_y,
+                u_diff_top_left_x,
+                u_diff_top_left_y,
+                u_diff_top_right_x,
+                u_diff_top_right_y
+            ) = Apic::get_grid_distances(self.cell_size, u_tx, u_ty);
+            
+            // V GRID
+            let (
+                mut v_weight_bottom_left,
+                mut v_weight_bottom_right,
+                mut v_weight_top_left,
+                mut v_weight_top_right,
+                v_index_bottom_left,
+                v_index_bottom_right,
+                v_index_top_left,
+                v_index_top_right,
+                v_tx,
+                v_ty,
+            ) = Apic::get_v_grid(self.width, self.height, grid_space_positions);
 
-                let ubl_idx = u_index_bottom_left.as_array_ref();
-                let ubr_idx = u_index_bottom_right.as_array_ref();
-                let utl_idx = u_index_top_left.as_array_ref();
-                let utr_idx = u_index_top_right.as_array_ref();
+            let (
+                v_diff_bottom_left_x,
+                v_diff_bottom_left_y,
+                v_diff_bottom_right_x,
+                v_diff_bottom_right_y,
+                v_diff_top_left_x,
+                v_diff_top_left_y,
+                v_diff_top_right_x,
+                v_diff_top_right_y
+            ) = Apic::get_grid_distances(self.cell_size, v_tx, v_ty);
 
-                let vbl_idx = v_index_bottom_left.as_array_ref();
-                let vbr_idx = v_index_bottom_right.as_array_ref();
-                let vtl_idx = v_index_top_left.as_array_ref();
-                let vtr_idx = v_index_top_right.as_array_ref();
+            u_weight_bottom_left *= w_t;
+            u_weight_bottom_right *= w_t;
+            u_weight_top_left *= w_t;
+            u_weight_top_right *= w_t;
 
-                let cbl_idx = c_index_back_left.as_array_ref();
-                let cbr_idx = c_index_back_right.as_array_ref();
-                let ctl_idx = c_index_top_left.as_array_ref();
-                let ctr_idx = c_index_top_right.as_array_ref();
+            v_weight_bottom_left *= w_t;
+            v_weight_bottom_right *= w_t;
+            v_weight_top_left *= w_t;
+            v_weight_top_right *= w_t;
+            
 
-                let grid_fluid_indexes_arr = grid_fluid_indexes.as_array_ref();
+            let u_add_bl = (velocities.x + c_u.x * u_diff_bottom_left_x + c_u.y * u_diff_bottom_left_y) * u_weight_bottom_left;
+            let u_add_br = (velocities.x + c_u.x * u_diff_bottom_right_x + c_u.y * u_diff_bottom_right_y) * u_weight_bottom_right;
+            let u_add_tl = (velocities.x + c_u.x * u_diff_top_left_x + c_u.y * u_diff_top_left_y) * u_weight_top_left;
+            let u_add_tr = (velocities.x + c_u.x * u_diff_top_right_x + c_u.y * u_diff_top_right_y) * u_weight_top_right;
 
-                unsafe {
-                    for lane in 0..active_lanes as usize {
-                        let grid_index = *grid_fluid_indexes_arr.get_unchecked(lane) as usize;
-                        *local_grid.type_fluid.get_unchecked_mut(grid_index / 64) |= 1u64 << (grid_index % 64);
+            let v_add_bl = (velocities.y + c_v.x * v_diff_bottom_left_x + c_v.y * v_diff_bottom_left_y) * v_weight_bottom_left;
+            let v_add_br = (velocities.y + c_v.x * v_diff_bottom_right_x + c_v.y * v_diff_bottom_right_y) * v_weight_bottom_right;
+            let v_add_tl = (velocities.y + c_v.x * v_diff_top_left_x + c_v.y * v_diff_top_left_y) * v_weight_top_left;
+            let v_add_tr = (velocities.y + c_v.x * v_diff_top_right_x + c_v.y * v_diff_top_right_y) * v_weight_top_right;
 
-                        let ubl = *ubl_idx.get_unchecked(lane) as usize;
-                        let ubr = *ubr_idx.get_unchecked(lane) as usize;
-                        let utl = *utl_idx.get_unchecked(lane) as usize;
-                        let utr = *utr_idx.get_unchecked(lane) as usize;
-                        *local_grid.mac_u.get_unchecked_mut(ubl) += *u_add_back_left_arr.get_unchecked(lane);
-                        *local_grid.mac_u.get_unchecked_mut(ubr) += *u_add_back_right_arr.get_unchecked(lane);
-                        *local_grid.mac_u.get_unchecked_mut(utl) += *u_add_top_left_arr.get_unchecked(lane);
-                        *local_grid.mac_u.get_unchecked_mut(utr) += *u_add_top_right_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_u.get_unchecked_mut(ubl) += *u_wt_back_left_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_u.get_unchecked_mut(ubr) += *u_wt_back_right_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_u.get_unchecked_mut(utl) += *u_wt_top_left_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_u.get_unchecked_mut(utr) += *u_wt_top_right_arr.get_unchecked(lane);
-                        local_grid.min_index_u = local_grid.min_index_u.min(ubl).min(ubr).min(utl).min(utr);
-                        local_grid.max_index_u = local_grid.max_index_u.max(ubl).max(ubr).max(utl).max(utr);
+        
+            let clamped_x = grid_space_positions.x.min(f32x8::splat(self.width as f32 - 1.0)).max(f32x8::ZERO);
+            let clamped_y = grid_space_positions.y.min(f32x8::splat(self.height as f32 - 1.0)).max(f32x8::ZERO);
+            let grid_fluid_indexes: u32x8 = bytemuck::cast((clamped_y.fast_trunc_int() * (self.width as i32)) + clamped_x.fast_trunc_int());
 
-                        let vbl = *vbl_idx.get_unchecked(lane) as usize;
-                        let vbr = *vbr_idx.get_unchecked(lane) as usize;
-                        let vtl = *vtl_idx.get_unchecked(lane) as usize;
-                        let vtr = *vtr_idx.get_unchecked(lane) as usize;
-                        *local_grid.mac_v.get_unchecked_mut(vbl) += *v_add_back_left_arr.get_unchecked(lane);
-                        *local_grid.mac_v.get_unchecked_mut(vbr) += *v_add_back_right_arr.get_unchecked(lane);
-                        *local_grid.mac_v.get_unchecked_mut(vtl) += *v_add_top_left_arr.get_unchecked(lane);
-                        *local_grid.mac_v.get_unchecked_mut(vtr) += *v_add_top_right_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_v.get_unchecked_mut(vbl) += *v_wt_back_left_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_v.get_unchecked_mut(vbr) += *v_wt_back_right_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_v.get_unchecked_mut(vtl) += *v_wt_top_left_arr.get_unchecked(lane);
-                        *local_grid.mac_weight_v.get_unchecked_mut(vtr) += *v_wt_top_right_arr.get_unchecked(lane);
-                        local_grid.min_index_v = local_grid.min_index_v.min(vbl).min(vbr).min(vtl).min(vtr);
-                        local_grid.max_index_v = local_grid.max_index_v.max(vbl).max(vbr).max(vtl).max(vtr);
+            let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
+                self.num_particles % 8
+            } else {
+                8
+            };
 
-                        let cbl = *cbl_idx.get_unchecked(lane) as usize;
-                        let cbr = *cbr_idx.get_unchecked(lane) as usize;
-                        let ctl = *ctl_idx.get_unchecked(lane) as usize;
-                        let ctr = *ctr_idx.get_unchecked(lane) as usize;
-                        *local_grid.mac_density.get_unchecked_mut(cbl) += *c_wt_back_left_arr.get_unchecked(lane);
-                        *local_grid.mac_density.get_unchecked_mut(cbr) += *c_wt_back_right_arr.get_unchecked(lane);
-                        *local_grid.mac_density.get_unchecked_mut(ctl) += *c_wt_top_left_arr.get_unchecked(lane);
-                        *local_grid.mac_density.get_unchecked_mut(ctr) += *c_wt_top_right_arr.get_unchecked(lane);
-                        local_grid.min_index_grid = local_grid.min_index_grid.min(cbl).min(cbr).min(ctl).min(ctr);
-                        local_grid.max_index_grid = local_grid.max_index_grid.max(cbl).max(cbr).max(ctl).max(ctr);
-                    }
+            let u_add_back_left_arr = u_add_bl.as_array_ref();
+            let u_add_back_right_arr = u_add_br.as_array_ref();
+            let u_add_top_left_arr = u_add_tl.as_array_ref();
+            let u_add_top_right_arr = u_add_tr.as_array_ref();
+            let u_wt_back_left_arr = u_weight_bottom_left.as_array_ref();
+            let u_wt_back_right_arr = u_weight_bottom_right.as_array_ref();
+            let u_wt_top_left_arr = u_weight_top_left.as_array_ref();
+            let u_wt_top_right_arr = u_weight_top_right.as_array_ref();
+
+            let v_add_back_left_arr = v_add_bl.as_array_ref();
+            let v_add_back_right_arr = v_add_br.as_array_ref();
+            let v_add_top_left_arr = v_add_tl.as_array_ref();
+            let v_add_top_right_arr = v_add_tr.as_array_ref();
+            let v_wt_back_left_arr = v_weight_bottom_left.as_array_ref();
+            let v_wt_back_right_arr = v_weight_bottom_right.as_array_ref();
+            let v_wt_top_left_arr = v_weight_top_left.as_array_ref();
+            let v_wt_top_right_arr = v_weight_top_right.as_array_ref();
+
+            let c_wt_back_left_arr = c_weight_back_left.as_array_ref();
+            let c_wt_back_right_arr = c_weight_back_right.as_array_ref();
+            let c_wt_top_left_arr = c_weight_top_left.as_array_ref();
+            let c_wt_top_right_arr = c_weight_top_right.as_array_ref();
+
+            let ubl_idx = u_index_bottom_left.as_array_ref();
+            let ubr_idx = u_index_bottom_right.as_array_ref();
+            let utl_idx = u_index_top_left.as_array_ref();
+            let utr_idx = u_index_top_right.as_array_ref();
+
+            let vbl_idx = v_index_bottom_left.as_array_ref();
+            let vbr_idx = v_index_bottom_right.as_array_ref();
+            let vtl_idx = v_index_top_left.as_array_ref();
+            let vtr_idx = v_index_top_right.as_array_ref();
+
+            let cbl_idx = c_index_back_left.as_array_ref();
+            let cbr_idx = c_index_back_right.as_array_ref();
+            let ctl_idx = c_index_top_left.as_array_ref();
+            let ctr_idx = c_index_top_right.as_array_ref();
+
+            let grid_fluid_indexes_arr = grid_fluid_indexes.as_array_ref();
+
+            unsafe {
+                for lane in 0..active_lanes as usize {
+                    let grid_index = *grid_fluid_indexes_arr.get_unchecked(lane) as usize;
+                    atomic_type_fluid[grid_index / 64].fetch_or(1u64 << (grid_index % 64), Relaxed);
+
+                    let ubl = *ubl_idx.get_unchecked(lane) as usize;
+                    let ubr = *ubr_idx.get_unchecked(lane) as usize;
+                    let utl = *utl_idx.get_unchecked(lane) as usize;
+                    let utr = *utr_idx.get_unchecked(lane) as usize;
+
+                    atomic_add_f32(&atomic_u[ubl], *u_add_back_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_u[ubr], *u_add_back_right_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_u[utl], *u_add_top_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_u[utr], *u_add_top_right_arr.get_unchecked(lane));
+
+                    atomic_add_f32(&atomic_wu[ubl], *u_wt_back_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_wu[ubr], *u_wt_back_right_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_wu[utl], *u_wt_top_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_wu[utr], *u_wt_top_right_arr.get_unchecked(lane));
+
+                    let vbl = *vbl_idx.get_unchecked(lane) as usize;
+                    let vbr = *vbr_idx.get_unchecked(lane) as usize;
+                    let vtl = *vtl_idx.get_unchecked(lane) as usize;
+                    let vtr = *vtr_idx.get_unchecked(lane) as usize;
+
+                    atomic_add_f32(&atomic_v[vbl], *v_add_back_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_v[vbr], *v_add_back_right_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_v[vtl], *v_add_top_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_v[vtr], *v_add_top_right_arr.get_unchecked(lane));
+
+                    atomic_add_f32(&atomic_wv[vbl], *v_wt_back_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_wv[vbr], *v_wt_back_right_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_wv[vtl], *v_wt_top_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_wv[vtr], *v_wt_top_right_arr.get_unchecked(lane));
+
+                    let cbl = *cbl_idx.get_unchecked(lane) as usize;
+                    let cbr = *cbr_idx.get_unchecked(lane) as usize;
+                    let ctl = *ctl_idx.get_unchecked(lane) as usize;
+                    let ctr = *ctr_idx.get_unchecked(lane) as usize;
+
+                    atomic_add_f32(&atomic_density[cbl], *c_wt_back_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_density[cbr], *c_wt_back_right_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_density[ctl], *c_wt_top_left_arr.get_unchecked(lane));
+                    atomic_add_f32(&atomic_density[ctr], *c_wt_top_right_arr.get_unchecked(lane));
                 }
             }
         });
 
 
-        let (left, right) = self.local_grids.split_at_mut(1);
-
-        for local_grid in right.iter() {
-            left[0].mac_u[local_grid.min_index_u..=local_grid.max_index_u].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_u[local_grid.min_index_u..=local_grid.max_index_u]).for_each(|(main, local)| {
-                *main += local;
-            });
-
-            left[0].mac_v[local_grid.min_index_v..=local_grid.max_index_v].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_v[local_grid.min_index_v..=local_grid.max_index_v]).for_each(|(main, local)| {
-                *main += local;
-            });
-
-            left[0].mac_weight_u[local_grid.min_index_u..=local_grid.max_index_u].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_u[local_grid.min_index_u..=local_grid.max_index_u]).for_each(|(main, local)| {
-                *main += local;
-            });
-
-            left[0].mac_weight_v[local_grid.min_index_v..=local_grid.max_index_v].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_weight_v[local_grid.min_index_v..=local_grid.max_index_v]).for_each(|(main, local)| {
-                *main += local;
-            });
-
-            left[0].mac_density[local_grid.min_index_grid..=local_grid.max_index_grid].par_iter_mut().with_min_len(4096).zip(&local_grid.mac_density[local_grid.min_index_grid..=local_grid.max_index_grid]).for_each(|(main, local)| {
-                *main += local;
-            });
-        }
-
-        for local_grid in self.local_grids.iter() {
-            self.base_grid.type_fluid.par_iter_mut().with_min_len(4096).zip(&local_grid.type_fluid).for_each(|(main, local)| {
-                *main |= local;
-            });
-        }
-        
-        let grid = &mut self.local_grids[0];
-        grid.mac_u.par_iter_mut()
-            .zip(grid.mac_weight_u.par_iter())
+        self.mac_u.par_iter_mut()
+            .zip(self.mac_weight_u.par_iter())
             .zip(self.mac_valid_u.par_iter_mut())
             .with_min_len(4096)
             .for_each(|((u, w), v)| {
@@ -1178,8 +1133,8 @@ impl Apic {
                 }
             });
 
-        grid.mac_v.par_iter_mut()
-            .zip(grid.mac_weight_v.par_iter())
+        self.mac_v.par_iter_mut()
+            .zip(self.mac_weight_v.par_iter())
             .zip(self.mac_valid_v.par_iter_mut())
             .with_min_len(4096)
             .for_each(|((u, w), v)| {
@@ -1344,11 +1299,11 @@ impl Apic {
     pub fn apply_external_forces(&mut self, deltatime: f32) {
         let gravity = self.world_properties.gravity * deltatime;
 
-        for i in 0..self.get_main_grid().mac_u.len() {
-            self.get_main_grid_mut().mac_u[i] += self.external_force_u[i] * deltatime;
+        for i in 0..self.mac_u.len() {
+            self.mac_u[i] += self.external_force_u[i] * deltatime;
         }
-        for i in 0..self.local_grids[0].mac_v.len() {
-            self.get_main_grid_mut().mac_v[i] += self.external_force_v[i] * deltatime;
+        for i in 0..self.mac_v.len() {
+            self.mac_v[i] += self.external_force_v[i] * deltatime;
         }
         
         for y in 0..=self.height as i32 {
@@ -1359,7 +1314,7 @@ impl Apic {
                 let is_top_fluid = self.is_fluid(x, y) == 1;
                 
                 if is_bottom_fluid || is_top_fluid {
-                    self.local_grids[0].mac_v[face_index] += gravity;
+                    self.mac_v[face_index] += gravity;
                 }
             }
         }
@@ -1383,8 +1338,8 @@ impl Apic {
         self.base_grid.plus_x_laplacian.fill(0.0);
         self.base_grid.plus_y_laplacian.fill(0.0);
 
-        self.smoothed_density.copy_from_slice(&self.local_grids[0].mac_density);
-        self.old_density.copy_from_slice(&self.local_grids[0].mac_density);
+        self.smoothed_density.copy_from_slice(&self.mac_density);
+        self.old_density.copy_from_slice(&self.mac_density);
         let width = self.width as usize;
 
         for _ in 0..3 {
@@ -1428,7 +1383,6 @@ impl Apic {
         let px_ptr = SendPtr(self.base_grid.plus_x_laplacian.as_mut_ptr());
         let py_ptr = SendPtr(self.base_grid.plus_y_laplacian.as_mut_ptr());
 
-        let grid = &self.local_grids[0];
         let process_laplacian = |cell_index: &u32| {
             let fluid_index = *cell_index as usize;
 
@@ -1436,10 +1390,10 @@ impl Apic {
             let grid_y = fluid_index / width;
 
             unsafe {
-                let mut u_left = *grid.mac_u.get_unchecked(self.u_index(grid_x as i32, grid_y as i32) as usize);
-                let mut u_right = *grid.mac_u.get_unchecked(self.u_index(grid_x as i32 + 1, grid_y as i32) as usize);
-                let mut v_bottom = *grid.mac_v.get_unchecked(self.v_index(grid_x as i32, grid_y as i32) as usize);
-                let mut v_top = *grid.mac_v.get_unchecked(self.v_index(grid_x as i32, grid_y as i32 + 1) as usize);
+                let mut u_left = *self.mac_u.get_unchecked(self.u_index(grid_x as i32, grid_y as i32) as usize);
+                let mut u_right = *self.mac_u.get_unchecked(self.u_index(grid_x as i32 + 1, grid_y as i32) as usize);
+                let mut v_bottom = *self.mac_v.get_unchecked(self.v_index(grid_x as i32, grid_y as i32) as usize);
+                let mut v_top = *self.mac_v.get_unchecked(self.v_index(grid_x as i32, grid_y as i32 + 1) as usize);
 
                 let non_obstacle_left = 1 - self.is_obstacle(grid_x as i32 - 1, grid_y as i32);
                 let non_obstacle_right = 1 - self.is_obstacle(grid_x as i32 + 1, grid_y as i32);
@@ -1683,7 +1637,7 @@ impl Apic {
         let target_density = 9.0;
         let inv_cell_size = 1.0 / cell_size;
 
-        let grid_u_ptr = SendPtr(self.get_main_grid_mut().mac_u.as_mut_ptr());
+        let grid_u_ptr = SendPtr(self.mac_u.as_mut_ptr());
         let valid_u_ptr = SendPtr(self.mac_valid_u.as_mut_ptr() as *mut u8);
 
         (0..self.height as i32).into_par_iter().for_each(|y| {
@@ -1728,7 +1682,7 @@ impl Apic {
             }
         });
 
-        let grid_v_ptr = SendPtr(self.get_main_grid_mut().mac_v.as_mut_ptr());
+        let grid_v_ptr = SendPtr(self.mac_v.as_mut_ptr());
         let valid_v_ptr = SendPtr(self.mac_valid_v.as_mut_ptr() as *mut u8);
         
         (0..=self.height as i32).into_par_iter().for_each(|y| {
@@ -1790,9 +1744,8 @@ impl Apic {
         let timestamp = self.timestamp;
         let border_damping = f32x8::splat(-self.world_properties.border_damping);
         
-        let grid = &self.local_grids[0];
-        let mac_grid_u = &grid.mac_u;
-        let mac_grid_v = &grid.mac_v;
+        let mac_grid_u = &self.mac_u;
+        let mac_grid_v = &self.mac_v;
         
         self.part_positions.par_iter_mut()
             .zip(self.part_velocities.par_iter_mut())
@@ -1975,13 +1928,13 @@ impl Apic {
         let height = self.height as usize;
 
         for _ in 0..4 {
-            std::mem::swap(&mut self.local_grids[0].mac_u, &mut self.old_grid_u);
+            std::mem::swap(&mut self.mac_u, &mut self.old_grid_u);
             std::mem::swap(&mut self.mac_valid_u, &mut self.next_valid_u);
 
             let old_grid_u = &self.old_grid_u;
             let next_valid_u = &self.next_valid_u;
 
-            self.local_grids[0].mac_u.par_iter_mut()
+            self.mac_u.par_iter_mut()
                 .zip(self.mac_valid_u.par_iter_mut())
                 .enumerate()
                 .with_min_len(512)
@@ -2013,13 +1966,13 @@ impl Apic {
             
             
         for _ in 0..4 {
-            std::mem::swap(&mut self.local_grids[0].mac_v, &mut self.old_grid_v);
+            std::mem::swap(&mut self.mac_v, &mut self.old_grid_v);
             std::mem::swap(&mut self.mac_valid_v, &mut self.next_valid_v);
 
             let old_grid_v = &self.old_grid_v;
             let next_valid_v = &self.next_valid_v;
 
-            self.local_grids[0].mac_v.par_iter_mut()
+            self.mac_v.par_iter_mut()
                 .zip(self.mac_valid_v.par_iter_mut())
                 .enumerate()
                 .with_min_len(512)
@@ -2151,11 +2104,11 @@ impl Apic {
             self.solve_pcg();
             self.apply_pressure_gradient();
 
-            for i in 0..self.local_grids[0].mac_u.len() {
-                self.local_grids[0].mac_u[i] += self.post_force_u[i] * step_deltatime;
+            for i in 0..self.mac_u.len() {
+                self.mac_u[i] += self.post_force_u[i] * step_deltatime;
             }
-            for i in 0..self.local_grids[0].mac_v.len() {
-                self.local_grids[0].mac_v[i] += self.post_force_v[i] * step_deltatime;
+            for i in 0..self.mac_v.len() {
+                self.mac_v[i] += self.post_force_v[i] * step_deltatime;
             }
 
             self.extrapolate_velocity();

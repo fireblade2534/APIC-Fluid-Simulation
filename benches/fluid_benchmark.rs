@@ -7,7 +7,7 @@ fn bench_fluid_update(c: &mut Criterion) {
 
     // Test with a couple of different grid sizes.
     // 32x32 and 64x64 are good baselines. (Ensure they are > 8 to spawn particles)
-    let grid_sizes = [64, 128, 256, 512];
+    let grid_sizes = [64, 128, 256, 512, 1024];
 
     for &size in grid_sizes.iter() {
         group.bench_with_input(
