@@ -239,8 +239,7 @@ pub fn atomic_add_f32(atomic: &AtomicU32, value: f32) {
 
 #[inline(always)]
 unsafe fn add_to_mac(
-    mac_ptr: SendPtr<AtomicU32>,
-    weight_ptr: SendPtr<AtomicU32>,
+    mac_and_weight_ptr: SendPtr<AtomicU64>,
     indices: &[u32; 8],
     velocities: &[f32; 8],
     weights: &[f32; 8],
@@ -261,10 +260,30 @@ unsafe fn add_to_mac(
                     processed |= 1 << other;
                 }
             }
-            let mac_index_ptr = mac_ptr.add(index);
-            let weight_index_ptr = weight_ptr.add(index);
-            atomic_add_f32(&*mac_index_ptr, value);
-            atomic_add_f32(&*weight_index_ptr, weight);
+
+            if value != 0.0 || weight != 0.0 {
+                let atomic = &*mac_and_weight_ptr.add(index);
+                let mut current = atomic.load(Relaxed);
+
+                loop {
+                    let new_vel = f32::from_bits((current & 0xFFFFFFFF) as u32) + value;
+                    let new_weight = f32::from_bits((current >> 32) as u32) + weight;
+
+                    let new_value = (new_vel.to_bits() as u64) | ((new_weight.to_bits() as u64) << 32);
+                    match atomic.compare_exchange_weak(current,
+                        new_value,
+                        Relaxed,
+                        Relaxed
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => {
+                            std::hint::spin_loop();
+                            current = actual;
+                        }
+                    }
+                }
+
+            }
         }
     }
 }
@@ -551,8 +570,8 @@ pub struct Apic {
 
     pub mac_u: Vec<f32>,
     pub mac_v: Vec<f32>,
-    pub mac_weight_u: Vec<f32>,
-    pub mac_weight_v: Vec<f32>,
+    pub mac_u_and_weight: Vec<u64>,
+    pub mac_v_and_weight: Vec<u64>,
     pub mac_density: Vec<f32>,
 
     pub old_grid_u: Vec<f32>,
@@ -562,7 +581,6 @@ pub struct Apic {
 
     pub search_vector: Vec<f32>,
     pub matrix_times_search: Vec<f32>,
-    pub w_vector: Vec<f32>,
     //pub part_lookup: Vec<(u32, u32)>,
 
     pub part_positions: Vec<Vec2x8>,
@@ -613,8 +631,8 @@ impl Apic {
 
         flip.mac_u.resize((flip.cells + flip.height) as usize, 0.0);
         flip.mac_v.resize((flip.cells + flip.width) as usize, 0.0);
-        flip.mac_weight_u.resize((flip.cells + flip.height) as usize, 0.0);
-        flip.mac_weight_v.resize((flip.cells + flip.width) as usize, 0.0);
+        flip.mac_u_and_weight.resize((flip.cells + flip.height) as usize, 0);
+        flip.mac_v_and_weight.resize((flip.cells + flip.width) as usize, 0);
         flip.mac_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
 
         flip.smoothed_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
@@ -622,7 +640,6 @@ impl Apic {
 
         flip.search_vector.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.matrix_times_search.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
-        flip.w_vector.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
 
         //flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
         flip.num_chunks = flip.cells / 2;
@@ -814,8 +831,8 @@ impl Apic {
             let positions = self.part_positions[chunk_index];
             let grid_space_positions = positions / f32x8::splat(self.cell_size);
 
-            let grid_x: u32x8 = bytemuck::cast(grid_space_positions.x.max(f32x8::ZERO).min(max_x).fast_trunc_int());
-            let grid_y: u32x8 = bytemuck::cast(grid_space_positions.y.max(f32x8::ZERO).min(max_y).fast_trunc_int());
+            let grid_x: u32x8 = bytemuck::cast(grid_space_positions.x.fast_max(f32x8::ZERO).fast_min(max_x).fast_trunc_int());
+            let grid_y: u32x8 = bytemuck::cast(grid_space_positions.y.fast_max(f32x8::ZERO).fast_min(max_y).fast_trunc_int());
 
             let grid_indexes: u32x8 = morton_code(grid_x, grid_y);
 
@@ -980,17 +997,15 @@ impl Apic {
         self.base_grid.fluid_indices.clear();
         self.mac_u.fill(0.0);
         self.mac_v.fill(0.0);
-        self.mac_weight_u.fill(0.0);
-        self.mac_weight_v.fill(0.0);
+        self.mac_u_and_weight.fill(0);
+        self.mac_v_and_weight.fill(0);
         self.mac_density.fill(0.0);
 
         self.mac_valid_u.fill(false);
         self.mac_valid_v.fill(false);
 
-        let atomic_u = SendPtr(self.mac_u.as_mut_ptr() as *mut AtomicU32);
-        let atomic_v = SendPtr(self.mac_v.as_mut_ptr() as *mut AtomicU32);
-        let atomic_wt_u = SendPtr(self.mac_weight_u.as_mut_ptr() as *mut AtomicU32);
-        let atomic_wt_v = SendPtr(self.mac_weight_v.as_mut_ptr() as *mut AtomicU32);
+        let atomic_u_and_wt = SendPtr(self.mac_u_and_weight.as_mut_ptr() as *mut AtomicU64);
+        let atomic_v_and_wt = SendPtr(self.mac_v_and_weight.as_mut_ptr() as *mut AtomicU64);
         let atomic_density = SendPtr(self.mac_density.as_mut_ptr() as *mut AtomicU32);
         let atomic_type_fluid = SendPtr(self.base_grid.type_fluid.as_mut_ptr() as *mut AtomicU64);
 
@@ -1115,8 +1130,8 @@ impl Apic {
             let v_add_tr = (velocities.y + c_v.x * v_diff_top_right_x + c_v.y * v_diff_top_right_y) * v_weight_top_right;
 
         
-            let clamped_x = grid_space_positions.x.min(f32x8::splat(self.width as f32 - 1.0)).max(f32x8::ZERO);
-            let clamped_y = grid_space_positions.y.min(f32x8::splat(self.height as f32 - 1.0)).max(f32x8::ZERO);
+            let clamped_x = grid_space_positions.x.fast_min(f32x8::splat(self.width as f32 - 1.0)).fast_max(f32x8::ZERO);
+            let clamped_y = grid_space_positions.y.fast_min(f32x8::splat(self.height as f32 - 1.0)).fast_max(f32x8::ZERO);
             let grid_fluid_indexes: u32x8 = bytemuck::cast((clamped_y.fast_trunc_int() * (self.width as i32)) + clamped_x.fast_trunc_int());
 
             let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
@@ -1168,15 +1183,15 @@ impl Apic {
             unsafe {
                 add_to_fluid(atomic_type_fluid, grid_fluid_indexes_arr, active_lanes);
 
-                add_to_mac(atomic_u, atomic_wt_u, ubl_idx, u_add_back_left_arr, u_wt_back_left_arr, active_lanes);
-                add_to_mac(atomic_u, atomic_wt_u, ubr_idx, u_add_back_right_arr, u_wt_back_right_arr, active_lanes);
-                add_to_mac(atomic_u, atomic_wt_u, utl_idx, u_add_top_left_arr, u_wt_top_left_arr, active_lanes);
-                add_to_mac(atomic_u, atomic_wt_u, utr_idx, u_add_top_right_arr, u_wt_top_right_arr, active_lanes);
+                add_to_mac(atomic_u_and_wt, ubl_idx, u_add_back_left_arr, u_wt_back_left_arr, active_lanes);
+                add_to_mac(atomic_u_and_wt, ubr_idx, u_add_back_right_arr, u_wt_back_right_arr, active_lanes);
+                add_to_mac(atomic_u_and_wt, utl_idx, u_add_top_left_arr, u_wt_top_left_arr, active_lanes);
+                add_to_mac(atomic_u_and_wt, utr_idx, u_add_top_right_arr, u_wt_top_right_arr, active_lanes);
 
-                add_to_mac(atomic_v, atomic_wt_v, vbl_idx, v_add_back_left_arr, v_wt_back_left_arr, active_lanes);
-                add_to_mac(atomic_v, atomic_wt_v, vbr_idx, v_add_back_right_arr, v_wt_back_right_arr, active_lanes);
-                add_to_mac(atomic_v, atomic_wt_v, vtl_idx, v_add_top_left_arr, v_wt_top_left_arr, active_lanes);
-                add_to_mac(atomic_v, atomic_wt_v, vtr_idx, v_add_top_right_arr, v_wt_top_right_arr, active_lanes);
+                add_to_mac(atomic_v_and_wt, vbl_idx, v_add_back_left_arr, v_wt_back_left_arr, active_lanes);
+                add_to_mac(atomic_v_and_wt, vbr_idx, v_add_back_right_arr, v_wt_back_right_arr, active_lanes);
+                add_to_mac(atomic_v_and_wt, vtl_idx, v_add_top_left_arr, v_wt_top_left_arr, active_lanes);
+                add_to_mac(atomic_v_and_wt, vtr_idx, v_add_top_right_arr, v_wt_top_right_arr, active_lanes);
 
                 add_to_density(atomic_density, cbl_idx, c_wt_back_left_arr, active_lanes);
                 add_to_density(atomic_density, cbr_idx, c_wt_back_right_arr, active_lanes);
@@ -1188,25 +1203,31 @@ impl Apic {
         rayon::join(
             || {
             self.mac_u.par_iter_mut()
-                .zip(self.mac_weight_u.par_iter())
+                .zip(self.mac_u_and_weight.par_iter())
                 .zip(self.mac_valid_u.par_iter_mut())
                 .with_min_len(4096)
-                .for_each(|((u, w), v)| {
-                    if *w > 0.0 {
+                .for_each(|((u, u_w), v)| {
+                    let weight = f32::from_bits((u_w >> 32) as u32);
+
+                    if weight > 0.0 {
+                        let vel = f32::from_bits((u_w & 0xFFFFFFFF) as u32);
                         *v = true;
-                        *u /= *w;
+                        *u = vel / weight;
                     }
                 });
             },
             || {
             self.mac_v.par_iter_mut()
-                .zip(self.mac_weight_v.par_iter())
+                .zip(self.mac_v_and_weight.par_iter())
                 .zip(self.mac_valid_v.par_iter_mut())
                 .with_min_len(4096)
-                .for_each(|((u, w), v)| {
-                    if *w > 0.0 {
+                .for_each(|((u, v_w), v)| {
+                    let weight = f32::from_bits((v_w >> 32) as u32);
+
+                    if weight > 0.0 {
+                        let vel = f32::from_bits((v_w & 0xFFFFFFFF) as u32);
                         *v = true;
-                        *u /= *w;
+                        *u = vel / weight;
                     }
                 });
             }
