@@ -171,7 +171,6 @@ impl RadixKey for SortableTuple {
     }
 }
 
-#[derive(Copy, Clone)]
 pub struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
@@ -184,6 +183,15 @@ impl<T> SendPtr<T> {
         }
     }
 }
+
+impl<T> Clone for SendPtr<T> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for SendPtr<T> {}
 
 #[inline(always)]
 pub fn as_atomic_u32_slice(slice: &mut [f32]) -> &[AtomicU32] {
@@ -224,6 +232,90 @@ pub fn atomic_add_f32(atomic: &AtomicU32, value: f32) {
                 std::hint::spin_loop();
                 current = actual;
             },
+        }
+    }
+}
+
+
+#[inline(always)]
+unsafe fn add_to_mac(
+    mac_ptr: SendPtr<AtomicU32>,
+    weight_ptr: SendPtr<AtomicU32>,
+    indices: &[u32; 8],
+    velocities: &[f32; 8],
+    weights: &[f32; 8],
+    active_lanes: usize
+) {
+    unsafe {
+        let mut processed = 0u8;
+        for lane in 0..active_lanes {
+            if (processed & (1 << lane)) != 0 { continue; }
+            let index = *indices.get_unchecked(lane) as usize;
+            let mut value = *velocities.get_unchecked(lane);
+            let mut weight = *weights.get_unchecked(lane);
+
+            for other in (lane + 1)..active_lanes {
+                if *indices.get_unchecked(other) as usize == index {
+                    value += *velocities.get_unchecked(other);
+                    weight += *weights.get_unchecked(other);
+                    processed |= 1 << other;
+                }
+            }
+            let mac_index_ptr = mac_ptr.add(index);
+            let weight_index_ptr = weight_ptr.add(index);
+            atomic_add_f32(&*mac_index_ptr, value);
+            atomic_add_f32(&*weight_index_ptr, weight);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn add_to_density(
+    density_ptr: SendPtr<AtomicU32>,
+    indices: &[u32; 8],
+    weights: &[f32; 8],
+    active_lanes: usize
+) {
+    unsafe {
+        let mut processed = 0u8;
+        for lane in 0..active_lanes {
+            if (processed & (1 << lane)) != 0 { continue; }
+            let index = *indices.get_unchecked(lane) as usize;
+            let mut weight = *weights.get_unchecked(lane);
+
+            for other in (lane + 1)..active_lanes {
+                if *indices.get_unchecked(other) as usize == index {
+                    weight += *weights.get_unchecked(other);
+                    processed |= 1 << other;
+                }
+            }
+            atomic_add_f32(&*density_ptr.add(index), weight);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn add_to_fluid(
+    fluid_ptr: SendPtr<AtomicU64>,
+    indices: &[u32; 8],
+    active_lanes: usize
+) {
+    unsafe {
+        let mut processed = 0u8;
+        for lane in 0..active_lanes {
+            if (processed & (1 << lane)) != 0 { continue; }
+            let grid_index = *indices.get_unchecked(lane) as usize;
+            let word_idx = grid_index / 64;
+            let mut mask = 1u64 << (grid_index % 64);
+
+            for other in (lane + 1)..active_lanes {
+                let other_index = *indices.get_unchecked(other) as usize;
+                if other_index / 64 == word_idx {
+                    mask |= 1u64 << (other_index % 64);
+                    processed |= 1 << other;
+                }
+            }
+            (*fluid_ptr.add(word_idx)).fetch_or(mask, Relaxed);
         }
     }
 }
@@ -895,12 +987,12 @@ impl Apic {
         self.mac_valid_u.fill(false);
         self.mac_valid_v.fill(false);
 
-        let atomic_u = as_atomic_u32_slice(&mut self.mac_u);
-        let atomic_v = as_atomic_u32_slice(&mut self.mac_v);
-        let atomic_wu = as_atomic_u32_slice(&mut self.mac_weight_u);
-        let atomic_wv = as_atomic_u32_slice(&mut self.mac_weight_v);
-        let atomic_density = as_atomic_u32_slice(&mut self.mac_density);
-        let atomic_type_fluid = as_atomic_u64_slice(&mut self.base_grid.type_fluid);
+        let atomic_u = SendPtr(self.mac_u.as_mut_ptr() as *mut AtomicU32);
+        let atomic_v = SendPtr(self.mac_v.as_mut_ptr() as *mut AtomicU32);
+        let atomic_wt_u = SendPtr(self.mac_weight_u.as_mut_ptr() as *mut AtomicU32);
+        let atomic_wt_v = SendPtr(self.mac_weight_v.as_mut_ptr() as *mut AtomicU32);
+        let atomic_density = SendPtr(self.mac_density.as_mut_ptr() as *mut AtomicU32);
+        let atomic_type_fluid = SendPtr(self.base_grid.type_fluid.as_mut_ptr() as *mut AtomicU64);
 
         (0..self.num_chunks as usize)
             .into_par_iter()
@@ -1028,7 +1120,7 @@ impl Apic {
             let grid_fluid_indexes: u32x8 = bytemuck::cast((clamped_y.fast_trunc_int() * (self.width as i32)) + clamped_x.fast_trunc_int());
 
             let active_lanes = if chunk_index == self.num_chunks as usize - 1 && self.num_particles % 8 != 0 {
-                self.num_particles % 8
+                self.num_particles as usize % 8
             } else {
                 8
             };
@@ -1074,50 +1166,22 @@ impl Apic {
             let grid_fluid_indexes_arr = grid_fluid_indexes.as_array_ref();
 
             unsafe {
-                for lane in 0..active_lanes as usize {
-                    let grid_index = *grid_fluid_indexes_arr.get_unchecked(lane) as usize;
-                    atomic_type_fluid[grid_index / 64].fetch_or(1u64 << (grid_index % 64), Relaxed);
+                add_to_fluid(atomic_type_fluid, grid_fluid_indexes_arr, active_lanes);
 
-                    let ubl = *ubl_idx.get_unchecked(lane) as usize;
-                    let ubr = *ubr_idx.get_unchecked(lane) as usize;
-                    let utl = *utl_idx.get_unchecked(lane) as usize;
-                    let utr = *utr_idx.get_unchecked(lane) as usize;
+                add_to_mac(atomic_u, atomic_wt_u, ubl_idx, u_add_back_left_arr, u_wt_back_left_arr, active_lanes);
+                add_to_mac(atomic_u, atomic_wt_u, ubr_idx, u_add_back_right_arr, u_wt_back_right_arr, active_lanes);
+                add_to_mac(atomic_u, atomic_wt_u, utl_idx, u_add_top_left_arr, u_wt_top_left_arr, active_lanes);
+                add_to_mac(atomic_u, atomic_wt_u, utr_idx, u_add_top_right_arr, u_wt_top_right_arr, active_lanes);
 
-                    atomic_add_f32(&atomic_u[ubl], *u_add_back_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_u[ubr], *u_add_back_right_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_u[utl], *u_add_top_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_u[utr], *u_add_top_right_arr.get_unchecked(lane));
+                add_to_mac(atomic_v, atomic_wt_v, vbl_idx, v_add_back_left_arr, v_wt_back_left_arr, active_lanes);
+                add_to_mac(atomic_v, atomic_wt_v, vbr_idx, v_add_back_right_arr, v_wt_back_right_arr, active_lanes);
+                add_to_mac(atomic_v, atomic_wt_v, vtl_idx, v_add_top_left_arr, v_wt_top_left_arr, active_lanes);
+                add_to_mac(atomic_v, atomic_wt_v, vtr_idx, v_add_top_right_arr, v_wt_top_right_arr, active_lanes);
 
-                    atomic_add_f32(&atomic_wu[ubl], *u_wt_back_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_wu[ubr], *u_wt_back_right_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_wu[utl], *u_wt_top_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_wu[utr], *u_wt_top_right_arr.get_unchecked(lane));
-
-                    let vbl = *vbl_idx.get_unchecked(lane) as usize;
-                    let vbr = *vbr_idx.get_unchecked(lane) as usize;
-                    let vtl = *vtl_idx.get_unchecked(lane) as usize;
-                    let vtr = *vtr_idx.get_unchecked(lane) as usize;
-
-                    atomic_add_f32(&atomic_v[vbl], *v_add_back_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_v[vbr], *v_add_back_right_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_v[vtl], *v_add_top_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_v[vtr], *v_add_top_right_arr.get_unchecked(lane));
-
-                    atomic_add_f32(&atomic_wv[vbl], *v_wt_back_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_wv[vbr], *v_wt_back_right_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_wv[vtl], *v_wt_top_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_wv[vtr], *v_wt_top_right_arr.get_unchecked(lane));
-
-                    let cbl = *cbl_idx.get_unchecked(lane) as usize;
-                    let cbr = *cbr_idx.get_unchecked(lane) as usize;
-                    let ctl = *ctl_idx.get_unchecked(lane) as usize;
-                    let ctr = *ctr_idx.get_unchecked(lane) as usize;
-
-                    atomic_add_f32(&atomic_density[cbl], *c_wt_back_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_density[cbr], *c_wt_back_right_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_density[ctl], *c_wt_top_left_arr.get_unchecked(lane));
-                    atomic_add_f32(&atomic_density[ctr], *c_wt_top_right_arr.get_unchecked(lane));
-                }
+                add_to_density(atomic_density, cbl_idx, c_wt_back_left_arr, active_lanes);
+                add_to_density(atomic_density, cbr_idx, c_wt_back_right_arr, active_lanes);
+                add_to_density(atomic_density, ctl_idx, c_wt_top_left_arr, active_lanes);
+                add_to_density(atomic_density, ctr_idx, c_wt_top_right_arr, active_lanes);
             }
         });
 
@@ -1513,37 +1577,42 @@ impl Apic {
         let width = self.width as usize;
         let fluid_cells = &self.base_grid.fluid_indices[..self.fluid_cells as usize];
         
-        let process_cell = |&cell_index| -> f32 {
-            let index = cell_index as usize;
-            unsafe {
-                let mut value = *self.base_grid.diag_laplacian.get_unchecked(index) * *input.get_unchecked(index);
-                
-                let px = *self.base_grid.plus_x_laplacian.get_unchecked(index);
-                if px != 0.0 { value = px.mul_add(*input.get_unchecked(index + 1), value); }
+        let process_chunk = |chunk: &[u32]| -> f32 {
+            let mut sum = 0.0;
+            for &cell_index in chunk {
+                let index = cell_index as usize;
+                unsafe {
+                    let mut value = *self.base_grid.diag_laplacian.get_unchecked(index) * *input.get_unchecked(index);
+                    
+                    let px = *self.base_grid.plus_x_laplacian.get_unchecked(index);
+                    if px != 0.0 { value = px.mul_add(*input.get_unchecked(index + 1), value); }
 
-                if index > 0 {
-                    let nx = *self.base_grid.plus_x_laplacian.get_unchecked(index - 1);
-                    if nx != 0.0 { value = nx.mul_add(*input.get_unchecked(index - 1), value); }
+                    if index > 0 {
+                        let nx = *self.base_grid.plus_x_laplacian.get_unchecked(index - 1);
+                        if nx != 0.0 { value = nx.mul_add(*input.get_unchecked(index - 1), value); }
+                    }
+
+                    let py = *self.base_grid.plus_y_laplacian.get_unchecked(index);
+                    if py != 0.0 { value = py.mul_add(*input.get_unchecked(index + width), value); }
+
+                    if index >= width {
+                        let ny = *self.base_grid.plus_y_laplacian.get_unchecked(index - width);
+                        if ny != 0.0 { value = ny.mul_add(*input.get_unchecked(index - width), value); }
+                    }
+                    
+                    *output.add(index) = value;
+                    
+                    sum += value * *input.get_unchecked(index);
                 }
-
-                let py = *self.base_grid.plus_y_laplacian.get_unchecked(index);
-                if py != 0.0 { value = py.mul_add(*input.get_unchecked(index + width), value); }
-
-                if index >= width {
-                    let ny = *self.base_grid.plus_y_laplacian.get_unchecked(index - width);
-                    if ny != 0.0 { value = ny.mul_add(*input.get_unchecked(index - width), value); }
-                }
-                
-                *output.add(index) = value;
-                
-                return value * *input.get_unchecked(index) 
             }
+
+            return sum;
         };
 
-        return if fluid_cells.len() > 4096 {
-            fluid_cells.par_iter().with_min_len(4096).map(process_cell).sum()
+        return if fluid_cells.len() >= 8192 {
+            fluid_cells.par_chunks(8192).map(process_chunk).sum()
         } else {
-            fluid_cells.iter().map(process_cell).sum()
+            process_chunk(fluid_cells)
         };
     }
     
@@ -1557,7 +1626,7 @@ impl Apic {
             }
         };
 
-        if fluid_cells > 4096 {
+        if fluid_cells >= 4096 {
             self.base_grid.fluid_indices[..self.fluid_cells as usize].par_iter().with_min_len(4096).for_each(clear_pressure_process);
         } else {
             self.base_grid.fluid_indices[..self.fluid_cells as usize].iter().for_each(clear_pressure_process);
