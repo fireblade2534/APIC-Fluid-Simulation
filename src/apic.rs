@@ -373,6 +373,10 @@ pub struct MultiGridLevel {
 
     pub residual: Vec<f32>,
     pub error: Vec<f32>,
+
+    pub cg_search: Vec<f32>,
+    pub cg_ap: Vec<f32>,
+    pub cg_residual: Vec<f32>, 
 }
 
 
@@ -381,6 +385,7 @@ impl MultiGridLevel {
         let mut multigrid = MultiGridLevel::default(); 
 
         let cells = width * height;
+        let padded_capacity = cells + (width * 2);
         
         multigrid.width = width;
         multigrid.height = height;
@@ -389,15 +394,26 @@ impl MultiGridLevel {
         multigrid.fluid_indices.reserve(cells.div_ceil(8) * 8);
         multigrid.red_indices.reserve(cells.div_ceil(2).div_ceil(8) * 8);
         multigrid.black_indices.reserve(cells.div_ceil(2).div_ceil(8) * 8);
-        multigrid.diag_laplacian.resize(cells.div_ceil(8) * 8, 0.0);
-        multigrid.inv_diag_laplacian.resize(cells.div_ceil(8) * 8, 0.0);
-        multigrid.plus_x_laplacian.resize(cells.div_ceil(8) * 8, 0.0);
-        multigrid.plus_y_laplacian.resize(cells.div_ceil(8) * 8, 0.0);
 
-        multigrid.residual.resize(cells.div_ceil(8) * 8, 0.0);
-        multigrid.error.resize(cells.div_ceil(8) * 8, 0.0);
+        let allocation_size = padded_capacity.div_ceil(8) * 8;
+        multigrid.diag_laplacian.resize(allocation_size, 0.0);
+        multigrid.inv_diag_laplacian.resize(allocation_size, 0.0);
+        multigrid.plus_x_laplacian.resize(allocation_size, 0.0);
+        multigrid.plus_y_laplacian.resize(allocation_size, 0.0);
+
+        multigrid.residual.resize(allocation_size, 0.0);
+        multigrid.error.resize(allocation_size, 0.0);
+        
 
         return multigrid;
+    }
+
+    pub fn allocate_cg(&mut self) {
+        let padded_capacity = self.cells + (self.width * 2);
+        let allocation_size = padded_capacity.div_ceil(8) * 8;
+        self.cg_search.resize(allocation_size, 0.0);
+        self.cg_ap.resize(allocation_size, 0.0);
+        self.cg_residual.resize(allocation_size, 0.0);
     }
 
     #[inline(always)]
@@ -430,18 +446,16 @@ impl MultiGridLevel {
                         let mut sum = *residual.get_unchecked(cell_index);
 
                         let px = *plus_x.get_unchecked(cell_index);
-                        if px != 0.0 { sum = (-px).mul_add(*error_ptr.add(cell_index + 1), sum); }
+                        sum = (-px).mul_add(*error_ptr.add(cell_index + 1), sum);
 
                         let py = *plus_y.get_unchecked(cell_index);
-                        if py != 0.0 { sum = (-py).mul_add(*error_ptr.add(cell_index + width), sum); }
+                        sum = (-py).mul_add(*error_ptr.add(cell_index + width), sum);
 
-                        if cell_index > 0 {
-                            sum = (-plus_x.get_unchecked(cell_index - 1)).mul_add(*error_ptr.add(cell_index - 1), sum);
-                        }
+                        sum = (-plus_x.get_unchecked(cell_index - 1)).mul_add(*error_ptr.add(cell_index - 1), sum);
 
-                        if cell_index >= width {
-                            sum = (-plus_y.get_unchecked(cell_index - width)).mul_add(*error_ptr.add(cell_index - width), sum);
-                        }
+                        
+                        sum = (-plus_y.get_unchecked(cell_index - width)).mul_add(*error_ptr.add(cell_index - width), sum);
+                        
                         
                         let gs_value = sum * inv_diag;
                         let old_error = *error_ptr.add(cell_index);
@@ -477,13 +491,16 @@ impl MultiGridLevel {
     }
 
     pub fn restrict(&self, coarse: &mut Self) {
-        coarse.error.fill(0.0);
+        let coarse_start = coarse.width;
+        let coarse_end = coarse_start + coarse.cells;
+        coarse.error[coarse_start..coarse_end].fill(0.0);
 
         let residual_ptr = SendPtr(coarse.residual.as_mut_ptr());
         
         let process = |&coarse_index| {
-            let coarse_x = coarse_index % coarse.width as u32;
-            let coarse_y = coarse_index / coarse.width as u32; 
+            let raw_coarse: usize = coarse_index as usize - coarse.width;
+            let coarse_x = raw_coarse % coarse.width;
+            let coarse_y = raw_coarse / coarse.width; 
 
             let mut sum = 0.0;
             
@@ -492,30 +509,27 @@ impl MultiGridLevel {
                     let fine_x = coarse_x * 2 + dx;
                     let fine_y = coarse_y * 2 + dy;
 
-                    let fine_index = (fine_y * self.width as u32 + fine_x) as usize;
-                    if self.is_fluid_index(fine_index) == 1 {
+                    let raw_fine = fine_y * self.width + fine_x;
+                    let padded_fine = raw_fine + self.width;
+                    
+                    if self.is_fluid_index(raw_fine) == 1 {
                         unsafe {
-                            let b = *self.residual.get_unchecked(fine_index);
+                            let b = *self.residual.get_unchecked(padded_fine);
 
-                            let mut ax = *self.diag_laplacian.get_unchecked(fine_index) * *self.error.get_unchecked(fine_index);
+                            let mut ax = *self.diag_laplacian.get_unchecked(padded_fine) * *self.error.get_unchecked(padded_fine);
                             
-                            let px = *self.plus_x_laplacian.get_unchecked(fine_index);
-                            if px != 0.0 {
-                                ax += px * *self.error.get_unchecked(fine_index + 1);
-                            }
+                            let px = *self.plus_x_laplacian.get_unchecked(padded_fine);
+                            ax += px * *self.error.get_unchecked(padded_fine + 1);
+                            
 
-                            let py = *self.plus_y_laplacian.get_unchecked(fine_index);
-                            if py != 0.0 {
-                                ax += py * *self.error.get_unchecked(fine_index + self.width);
-                            }
+                            let py = *self.plus_y_laplacian.get_unchecked(padded_fine);
+                            ax += py * *self.error.get_unchecked(padded_fine + self.width);
                             
-                            if fine_x > 0 {
-                                ax += *self.plus_x_laplacian.get_unchecked(fine_index - 1) * *self.error.get_unchecked(fine_index - 1);
-                            }
                             
-                            if fine_y > 0 {
-                                ax += *self.plus_y_laplacian.get_unchecked(fine_index - self.width) * *self.error.get_unchecked(fine_index - self.width);
-                            }
+                            ax += *self.plus_x_laplacian.get_unchecked(padded_fine - 1) * *self.error.get_unchecked(padded_fine - 1);
+                            
+                            
+                            ax += *self.plus_y_laplacian.get_unchecked(padded_fine - self.width) * *self.error.get_unchecked(padded_fine - self.width);
 
                             sum += b - ax;
                         }
@@ -539,12 +553,14 @@ impl MultiGridLevel {
         let error_ptr = SendPtr(self.error.as_mut_ptr());
 
         let process = |&fine_index| {
-            let coarse_x = (fine_index % self.width as u32) / 2;
-            let coarse_y = (fine_index / self.width as u32) / 2;
-            let coarse_index = (coarse_y * coarse.width as u32 + coarse_x) as usize;
+            let raw_fine = fine_index as usize - self.width;
+            let coarse_x = (raw_fine % self.width) / 2;
+            let coarse_y = (raw_fine / self.width) / 2;
+
+            let raw_coarse = coarse_y * coarse.width + coarse_x + coarse.width;
 
             unsafe {
-                *error_ptr.add(fine_index as usize) += coarse.error[coarse_index];
+                *error_ptr.add(fine_index as usize) += coarse.error[raw_coarse];
             }
         };
 
@@ -553,6 +569,94 @@ impl MultiGridLevel {
         } else {
             self.fluid_indices.iter().for_each(process);
         }
+    }
+
+    pub fn solve_coarse_exact(&mut self) {
+        let start = self.width as usize;
+        let end = start + self.cells;
+
+        self.error[start..end].fill(0.0);
+
+        self.cg_residual[start..end].copy_from_slice(&self.residual[start..end]);
+        self.cg_search[start..end].copy_from_slice(&self.residual[start..end]);
+
+        let mut gamma = 0.0;
+        for index in &self.fluid_indices {
+            gamma += self.cg_residual[*index as usize] * self.cg_residual[*index as usize];
+        }
+
+        if gamma < 1e-12 {
+            return;
+        }
+
+        let max_iterations = self.fluid_indices.len().min(100);
+        let width = self.width as usize;
+
+        for _ in 0..max_iterations {
+            let mut delta = 0.0;
+            for index in &self.fluid_indices {
+                let fluid_index = *index as usize;
+                
+                unsafe {
+                    let mut value = *self.diag_laplacian.get_unchecked(fluid_index) * *self.cg_search.get_unchecked(fluid_index);
+
+                    let px = *self.plus_x_laplacian.get_unchecked(fluid_index);
+                    value = px.mul_add(*self.cg_search.get_unchecked(fluid_index + 1), value);
+
+                    let nx = *self.plus_x_laplacian.get_unchecked(fluid_index - 1);
+                    value = nx.mul_add(*self.cg_search.get_unchecked(fluid_index - 1), value);
+
+                    let py = *self.plus_y_laplacian.get_unchecked(fluid_index);
+                    value = py.mul_add(*self.cg_search.get_unchecked(fluid_index + width), value);
+
+                    let ny = *self.plus_y_laplacian.get_unchecked(fluid_index - width);
+                    value = ny.mul_add(*self.cg_search.get_unchecked(fluid_index - width), value);
+
+                    *self.cg_ap.get_unchecked_mut(fluid_index) = value;
+                    delta += *self.cg_search.get_unchecked(fluid_index) * value;
+                }
+            }
+
+            if delta.abs() < SAFTY {
+                break;
+            }
+
+            let alpha = gamma / delta;
+            let mut max_error: f32 = 0.0;
+
+            for index in &self.fluid_indices {
+                let fluid_index = *index as usize;
+                unsafe {
+                    *self.error.get_unchecked_mut(fluid_index) += alpha * *self.cg_search.get_unchecked(fluid_index);
+                    *self.cg_search.get_unchecked_mut(fluid_index) -= alpha * *self.cg_ap.get_unchecked(fluid_index);
+
+                    max_error = max_error.max(self.cg_residual.get_unchecked(fluid_index).abs())
+                }
+            }
+
+            if max_error < 1e-6 {
+                break;
+            }
+
+            let mut new_gamma = 0.0;
+            for index in &self.fluid_indices {
+                let fluid_index = *index as usize;
+                unsafe {
+                    new_gamma += *self.cg_residual.get_unchecked(fluid_index) * *self.cg_residual.get_unchecked(fluid_index);
+                }
+            }
+
+            let beta = new_gamma / gamma;
+            gamma = new_gamma;
+
+            for index in &self.fluid_indices {
+                let fluid_index = *index as usize;
+                unsafe {
+                    *self.cg_search.get_unchecked_mut(fluid_index) = self.cg_residual.get_unchecked(fluid_index) + (beta * self.cg_search.get_unchecked(fluid_index))
+                }
+            }
+        }
+        
     }
 }
 
@@ -658,8 +762,11 @@ impl Apic {
         flip.smoothed_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.old_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
 
-        flip.search_vector.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
-        flip.matrix_times_search.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+        let pcg_padded_capacity = flip.cells + (flip.width * 2);
+        let pcg_allocation_size = pcg_padded_capacity.div_ceil(8) * 8;
+
+        flip.search_vector.resize(pcg_allocation_size as usize, 0.0);
+        flip.matrix_times_search.resize(pcg_allocation_size as usize, 0.0);
 
         //flip.part_lookup.resize((flip.cells / 2) as usize, (0, 0));
         flip.num_chunks = flip.cells / 2;
@@ -750,6 +857,9 @@ impl Apic {
             flip.multigrid_levels.push(MultiGridLevel::new(current_width, current_height));
         }
 
+        let last = flip.multigrid_levels.len() - 1;
+        flip.multigrid_levels[last].allocate_cg();
+
         return flip;
     }
 
@@ -809,7 +919,16 @@ impl Apic {
         let index = ((j * self.width as i32) + i) as u32;
         let obstacle = self.mac_type_obstacle[(index >> 6) as usize];
 
-        return 1 & (obstacle >> (index % 64));
+        return 1 & (obstacle >> (index & 63));
+    }
+ 
+    #[inline(always)]
+    pub fn is_obstacle_index(&self, index: usize) -> u64 {
+        unsafe {
+            let obstacle = self.mac_type_obstacle.get_unchecked(index >> 6);
+
+            return 1 & (obstacle >> (index & 63));
+        }
     }
 
     #[inline(always)]
@@ -1267,16 +1386,18 @@ impl Apic {
             let mut fluid_mask = self.base_grid.type_fluid[i];
 
             while fluid_mask != 0 {
-                let cell_index = (i * 64) + (fluid_mask.trailing_zeros() as usize);
-                self.base_grid.fluid_indices.push(cell_index as u32);
+                let raw_cell_index = (i * 64) + (fluid_mask.trailing_zeros() as usize);
+                let padded_index = raw_cell_index + self.width as usize;
+
+                self.base_grid.fluid_indices.push(padded_index as u32);
                 self.fluid_cells += 1;
 
-                let x = cell_index % self.width as usize;
-                let y = cell_index / self.width as usize;
+                let x = raw_cell_index % self.width as usize;
+                let y = raw_cell_index / self.width as usize;
                 if (x + y) % 2 == 0 {
-                    self.base_grid.red_indices.push(cell_index as u32);
+                    self.base_grid.red_indices.push(padded_index as u32);
                 } else {
-                    self.base_grid.black_indices.push(cell_index as u32);
+                    self.base_grid.black_indices.push(padded_index as u32);
                 }
 
                 fluid_mask &= fluid_mask - 1;
@@ -1310,17 +1431,22 @@ impl Apic {
             coarse_grid.red_indices.clear();
             coarse_grid.black_indices.clear();
             coarse_grid.type_fluid.fill(0);
-            coarse_grid.diag_laplacian.fill(0.0);
-            coarse_grid.inv_diag_laplacian.fill(0.0);
-            coarse_grid.plus_x_laplacian.fill(0.0);
-            coarse_grid.plus_y_laplacian.fill(0.0);
+
+            let coarse_start = coarse_grid.width;
+            let coarse_end = coarse_start + coarse_grid.cells;
+
+            coarse_grid.diag_laplacian[coarse_start..coarse_end].fill(0.0);
+            coarse_grid.inv_diag_laplacian[coarse_start..coarse_end].fill(0.0);
+            coarse_grid.plus_x_laplacian[coarse_start..coarse_end].fill(0.0);
+            coarse_grid.plus_y_laplacian[coarse_start..coarse_end].fill(0.0);
 
             let new_width = coarse_grid.width as u32;
             let new_height = coarse_grid.height as u32;
 
             for cell_index in &fine_grid.fluid_indices {
-                let new_x = (cell_index % width) / 2;
-                let new_y = (cell_index / width) / 2;
+                let raw_fine = *cell_index - width;
+                let new_x = (raw_fine % width) / 2;
+                let new_y = (raw_fine / width) / 2;
                 
                 let new_index = (new_y * new_width) + new_x;
                 coarse_grid.type_fluid[(new_index / 64) as usize] |= 1u64 << (new_index % 64);
@@ -1329,16 +1455,18 @@ impl Apic {
             for index in 0..coarse_grid.type_fluid.len() {
                 let mut fluid_mask = coarse_grid.type_fluid[index];
                 while fluid_mask != 0 {
-                    let cell_index = ((index * 64) + (fluid_mask.trailing_zeros() as usize)) as u32;
-                    coarse_grid.fluid_indices.push(cell_index);
+                    let raw_cell_index = ((index * 64) + (fluid_mask.trailing_zeros() as usize)) as u32;
+                    let padded_index = raw_cell_index + new_width;
 
-                    let x = cell_index % new_width;
-                    let y = cell_index / new_width;
+                    coarse_grid.fluid_indices.push(padded_index);
+
+                    let x = raw_cell_index % new_width;
+                    let y = raw_cell_index / new_width;
 
                     if (x + y) % 2 == 0 {
-                        coarse_grid.red_indices.push(cell_index);
+                        coarse_grid.red_indices.push(padded_index);
                     } else {
-                        coarse_grid.black_indices.push(cell_index);
+                        coarse_grid.black_indices.push(padded_index);
                     }
                     fluid_mask &= fluid_mask - 1;
                 }
@@ -1346,8 +1474,8 @@ impl Apic {
 
             for cell_index in &coarse_grid.fluid_indices {
                 let coarse_index = *cell_index as usize;
-                let cx = coarse_index % coarse_grid.width;
-                let cy = coarse_index / coarse_grid.width;
+                let cx = (coarse_index - coarse_grid.width) % coarse_grid.width;
+                let cy = (coarse_index - coarse_grid.width) / coarse_grid.width;
                 
                 let mut diag = 0.0;
                 let mut plus_x = 0.0;
@@ -1360,23 +1488,24 @@ impl Apic {
                         
                         if fx >= fine_grid.width || fy >= fine_grid.height { continue; }
                         
-                        let fine_index = fy * fine_grid.width + fx;
+                        let fine_raw = fy * fine_grid.width + fx;
+                        let fine_padded = fine_raw + fine_grid.width;
                         
-                        if fine_grid.is_fluid_index(fine_index) == 1 {
-                            diag += fine_grid.diag_laplacian[fine_index];
+                        if fine_grid.is_fluid_index(fine_raw) == 1 {
+                            diag += fine_grid.diag_laplacian[fine_padded];
                             
-                            if dx == 0 && fx + 1 < fine_grid.width {
-                                diag += 2.0 * fine_grid.plus_x_laplacian[fine_index];
+                            if dx == 0 {
+                                diag += 2.0 * fine_grid.plus_x_laplacian[fine_padded];
                             }
-                            if dy == 0 && fy + 1 < fine_grid.height {
-                                diag += 2.0 * fine_grid.plus_y_laplacian[fine_index];
+                            if dy == 0 {
+                                diag += 2.0 * fine_grid.plus_y_laplacian[fine_padded];
                             }
                             
-                            if dx == 1 && fx + 1 < fine_grid.width {
-                                plus_x += fine_grid.plus_x_laplacian[fine_index];
+                            if dx == 1 {
+                                plus_x += fine_grid.plus_x_laplacian[fine_padded];
                             }
-                            if dy == 1 && fy + 1 < fine_grid.height {
-                                plus_y += fine_grid.plus_y_laplacian[fine_index];
+                            if dy == 1 {
+                                plus_y += fine_grid.plus_y_laplacian[fine_padded];
                             }
                         }
                     }
@@ -1429,10 +1558,13 @@ impl Apic {
     }
 
     pub fn build_pressure_system(&mut self) {
-        self.base_grid.diag_laplacian.fill(0.0);
-        self.base_grid.inv_diag_laplacian.fill(0.0);
-        self.base_grid.plus_x_laplacian.fill(0.0);
-        self.base_grid.plus_y_laplacian.fill(0.0);
+        let start = self.width as usize;
+        let end = start + self.cells as usize;
+
+        self.base_grid.diag_laplacian[start..end].fill(0.0);
+        self.base_grid.inv_diag_laplacian[start..end].fill(0.0);
+        self.base_grid.plus_x_laplacian[start..end].fill(0.0);
+        self.base_grid.plus_y_laplacian[start..end].fill(0.0);
 
         self.smoothed_density.copy_from_slice(&self.mac_density);
         self.old_density.copy_from_slice(&self.mac_density);
@@ -1444,20 +1576,24 @@ impl Apic {
             let old_density_ptr = SendPtr(self.old_density.as_mut_ptr());
 
             let smooth_density_process = |cell_index: &u32| {
-                let index = *cell_index as usize;
-                let grid_x = index % width;
-                let grid_y = index / width;
+                let raw_index = *cell_index as usize - width;
                 
                 unsafe {
-                    let mut sum = *old_density_ptr.add(index) * 4.0;
+                    let mut sum = *old_density_ptr.add(raw_index) * 4.0;
                     let mut weight = 4.0;
                     
-                    if grid_x > 0 && self.is_fluid_index(index - 1) == 1 { sum += *old_density_ptr.add(index - 1); weight += 1.0; }
-                    if grid_x < width - 1 && self.is_fluid_index(index + 1) == 1 { sum += *old_density_ptr.add(index + 1); weight += 1.0; }
-                    if grid_y > 0 && self.is_fluid_index(index - width) == 1 { sum += *old_density_ptr.add(index - width); weight += 1.0; }
-                    if grid_y < self.height as usize - 1 && self.is_fluid_index(index + width) == 1 { sum += *old_density_ptr.add(index + width); weight += 1.0; }
+                    let fluid_left = self.is_fluid_index(raw_index - 1) as f32;
+                    let fluid_right = self.is_fluid_index(raw_index + 1) as f32;
+                    let fluid_bottom = self.is_fluid_index(raw_index - width) as f32;
+                    let fluid_top = self.is_fluid_index(raw_index + width) as f32;
+
+                    sum += *old_density_ptr.add(raw_index - 1) * fluid_left;
+                    sum += *old_density_ptr.add(raw_index + 1) * fluid_right;
+                    sum += *old_density_ptr.add(raw_index - width) * fluid_bottom;
+                    sum += *old_density_ptr.add(raw_index + width) * fluid_top;
                     
-                    *smoothed_ptr.add(index) = sum / weight;
+                    weight += fluid_left + fluid_right + fluid_bottom + fluid_top;
+                    *smoothed_ptr.add(raw_index) = sum / weight;
                 }
             };
 
@@ -1481,20 +1617,22 @@ impl Apic {
 
         let process_laplacian = |cell_index: &u32| {
             let fluid_index = *cell_index as usize;
+            let raw_index = fluid_index - width;
 
-            let grid_x = fluid_index % width;
-            let grid_y = fluid_index / width;
+            let grid_x = raw_index % width;
+            let grid_y = raw_index / width;
+            let u_index = grid_y * (width + 1) + grid_x;
 
             unsafe {
-                let mut u_left = *self.mac_u.get_unchecked(self.u_index(grid_x as i32, grid_y as i32) as usize);
-                let mut u_right = *self.mac_u.get_unchecked(self.u_index(grid_x as i32 + 1, grid_y as i32) as usize);
-                let mut v_bottom = *self.mac_v.get_unchecked(self.v_index(grid_x as i32, grid_y as i32) as usize);
-                let mut v_top = *self.mac_v.get_unchecked(self.v_index(grid_x as i32, grid_y as i32 + 1) as usize);
+                let mut u_left = *self.mac_u.get_unchecked(u_index);
+                let mut u_right = *self.mac_u.get_unchecked(u_index + 1);
+                let mut v_bottom = *self.mac_v.get_unchecked(raw_index);
+                let mut v_top = *self.mac_v.get_unchecked(raw_index + width);
 
-                let non_obstacle_left = 1 - self.is_obstacle(grid_x as i32 - 1, grid_y as i32);
-                let non_obstacle_right = 1 - self.is_obstacle(grid_x as i32 + 1, grid_y as i32);
-                let non_obstacle_bottom = 1 - self.is_obstacle(grid_x as i32, grid_y as i32 - 1);
-                let non_obstacle_top = 1 - self.is_obstacle(grid_x as i32, grid_y as i32 + 1);
+                let non_obstacle_left = 1 - self.is_obstacle_index(raw_index - 1);
+                let non_obstacle_right = 1 - self.is_obstacle_index(raw_index + 1);
+                let non_obstacle_bottom = 1 - self.is_obstacle_index(raw_index - width);
+                let non_obstacle_top = 1 - self.is_obstacle_index(raw_index + width);
 
                 u_left *= non_obstacle_left as f32;
                 u_right *= non_obstacle_right as f32;
@@ -1503,14 +1641,14 @@ impl Apic {
 
                 let divergence = (u_right - u_left) + (v_top - v_bottom);
             
-                let rho_center = self.smoothed_density[fluid_index];
+                let rho_center = self.smoothed_density[raw_index];
 
                 let density_excess = (rho_center - noise_threshold).max(0.0).min(target_density);
 
-                let fluid_left = self.is_fluid(grid_x as i32 - 1, grid_y as i32);
-                let fluid_right = self.is_fluid(grid_x as i32 + 1, grid_y as i32);
-                let fluid_bottom = self.is_fluid(grid_x as i32, grid_y as i32 - 1);
-                let fluid_top = self.is_fluid(grid_x as i32, grid_y as i32 + 1);
+                let fluid_left = self.is_fluid_index(raw_index - 1);
+                let fluid_right = self.is_fluid_index(raw_index + 1);
+                let fluid_bottom = self.is_fluid_index(raw_index - width);
+                let fluid_top = self.is_fluid_index(raw_index + width);
 
                 let mut diag = 0.0;
                 let mut px = 0.0;
@@ -1520,7 +1658,7 @@ impl Apic {
                     if fluid_left == 1 { 
                         diag += 1.0;
                     } else {
-                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index - 1], rho_center, target_density);
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[raw_index - 1], rho_center, target_density);
                     }
                 }
                 
@@ -1529,7 +1667,7 @@ impl Apic {
                         diag += 1.0; 
                         px = -1.0; 
                     } else { 
-                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index + 1], rho_center, target_density); 
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[raw_index + 1], rho_center, target_density); 
                     }
                 }
 
@@ -1537,7 +1675,7 @@ impl Apic {
                     if fluid_bottom == 1 { 
                         diag += 1.0;
                     } else {
-                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index - width], rho_center, target_density);
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[raw_index - width], rho_center, target_density);
                     }
                 }
 
@@ -1546,7 +1684,7 @@ impl Apic {
                         diag += 1.0; 
                         py = -1.0; 
                     } else { 
-                        diag += 1.0 / self.calculate_theta(self.smoothed_density[fluid_index + width], rho_center, target_density); 
+                        diag += 1.0 / self.calculate_theta(self.smoothed_density[raw_index + width], rho_center, target_density); 
                     }
                 }
 
@@ -1568,7 +1706,10 @@ impl Apic {
 
 
     pub fn apply_preconditioner(&mut self) {
-        self.base_grid.error.fill(0.0);
+        let start = self.width as usize;
+        let end = start + self.cells as usize;
+
+        self.base_grid.error[start..end].fill(0.0);
 
         self.base_grid.smooth_level(1, false, 1.2);
 
@@ -1584,8 +1725,7 @@ impl Apic {
                 left[level_index].restrict(&mut right[0]);
             }
 
-            self.multigrid_levels[last].smooth_level(5, false, 1.2);
-            self.multigrid_levels[last].smooth_level(5, true, 1.2);
+            self.multigrid_levels[last].solve_coarse_exact();
 
             for level_index in (0..last).rev() {
                 let (left, right) = self.multigrid_levels.split_at_mut(level_index + 1);
@@ -1613,20 +1753,18 @@ impl Apic {
                     let mut value = *self.base_grid.diag_laplacian.get_unchecked(index) * *input.get_unchecked(index);
                     
                     let px = *self.base_grid.plus_x_laplacian.get_unchecked(index);
-                    if px != 0.0 { value = px.mul_add(*input.get_unchecked(index + 1), value); }
+                    value = px.mul_add(*input.get_unchecked(index + 1), value);
 
-                    if index > 0 {
-                        let nx = *self.base_grid.plus_x_laplacian.get_unchecked(index - 1);
-                        if nx != 0.0 { value = nx.mul_add(*input.get_unchecked(index - 1), value); }
-                    }
+                    let nx = *self.base_grid.plus_x_laplacian.get_unchecked(index - 1);
+                    value = nx.mul_add(*input.get_unchecked(index - 1), value);
+                    
 
                     let py = *self.base_grid.plus_y_laplacian.get_unchecked(index);
-                    if py != 0.0 { value = py.mul_add(*input.get_unchecked(index + width), value); }
+                    value = py.mul_add(*input.get_unchecked(index + width), value);
 
-                    if index >= width {
-                        let ny = *self.base_grid.plus_y_laplacian.get_unchecked(index - width);
-                        if ny != 0.0 { value = ny.mul_add(*input.get_unchecked(index - width), value); }
-                    }
+                    let ny = *self.base_grid.plus_y_laplacian.get_unchecked(index - width);
+                    value = ny.mul_add(*input.get_unchecked(index - width), value);
+                    
                     
                     *output.add(index) = value;
                     
@@ -1647,10 +1785,14 @@ impl Apic {
     pub fn solve_pcg(&mut self) {
         let fluid_cells = self.fluid_cells;
 
+        let start = self.width as usize;
+        let end = start + self.cells as usize;
+
         let pressure_ptr = SendPtr(self.mac_pressure_grid.as_mut_ptr());
         let clear_pressure_process = |cell_index: &u32| {
             unsafe {
-                *pressure_ptr.add(*cell_index as usize) = 0.0;
+                let raw_index = *cell_index as usize - self.width as usize;
+                *pressure_ptr.add(raw_index) = 0.0;
             }
         };
 
@@ -1662,9 +1804,8 @@ impl Apic {
 
         self.apply_preconditioner();
 
-        self.search_vector.copy_from_slice(&self.base_grid.error);
-
-        let mut gamma = dot_product(&self.base_grid.residual, &self.base_grid.error);
+        self.search_vector[start..end].copy_from_slice(&self.base_grid.error[start..end]);
+        let mut gamma = dot_product(&self.base_grid.residual[start..end], &self.base_grid.error[start..end]);
 
         if gamma < SAFTY {
             return;
@@ -1687,13 +1828,14 @@ impl Apic {
             let mut max_error: f32 = 0.0;
 
             let max_error_process = |cell_index: &u32| {
-                let index = *cell_index as usize;
+                let padded_index = *cell_index as usize;
+                let raw_index = padded_index - self.width as usize;
                 unsafe {
-                    *pressure_ptr.add(index) += alpha * *search_ptr.add(index);
+                    *pressure_ptr.add(raw_index) += alpha * *search_ptr.add(padded_index);
 
-                    let new_residual = (-alpha).mul_add(*matrix_ptr.add(index), *residual_ptr.add(index));
+                    let new_residual = (-alpha).mul_add(*matrix_ptr.add(padded_index), *residual_ptr.add(padded_index));
 
-                    *residual_ptr.add(index) = new_residual;
+                    *residual_ptr.add(padded_index) = new_residual;
 
                     return new_residual.abs();
                 }
@@ -1711,7 +1853,7 @@ impl Apic {
 
             self.apply_preconditioner();
 
-            let new_gamma = dot_product(&self.base_grid.residual, &self.base_grid.error);
+            let new_gamma = dot_product(&self.base_grid.residual[start..end], &self.base_grid.error[start..end]);
 
             if new_gamma < SAFTY {
                 break; 
