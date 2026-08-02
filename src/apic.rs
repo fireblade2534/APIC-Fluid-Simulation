@@ -1,11 +1,12 @@
-use std::{cell, mem, sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed}};
+use std::{cell, mem, sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering::Relaxed}};
 use rdst::{RadixKey, RadixSort};
 
 use rayon::{iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator}, slice::{ParallelSlice, ParallelSliceMut}};
 use ultraviolet::{Vec2, Vec2x8};
-use wide::{CmpGt, CmpLe, CmpLt, f32x8, i32x8, u32x8};
+use wide::{CmpGt, CmpLe, CmpLt, CmpNe, f32x8, i32x8, u32x8};
 
 const SAFTY: f32 = 1e-5;
+
 
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     
@@ -19,7 +20,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
         sum += va * vb;
     }
     
-    let mut result = sum.to_array().iter().sum();
+    let mut result = sum.reduce_add();
     for (remainder_a, remainder_b) in reminder_a.iter().zip(reminder_b.iter()) {
         result += remainder_a * remainder_b;
     }
@@ -78,35 +79,35 @@ pub fn scatter_f32x8(slice: &mut [f32], values: f32x8, indices: u32x8) {
 }
 
 #[inline(always)]
-pub fn gather_ptr_f32x8(error_ptr: SendPtr<f32>, indices: u32x8) -> f32x8 {
+pub fn gather_ptr_f32x8(ptr: SendPtr<f32>, indices: u32x8) -> f32x8 {
     let indexes = indices.as_array_ref();
     unsafe {
         f32x8::from([
-            *error_ptr.add(*indexes.get_unchecked(0) as usize),
-            *error_ptr.add(*indexes.get_unchecked(1) as usize),
-            *error_ptr.add(*indexes.get_unchecked(2) as usize),
-            *error_ptr.add(*indexes.get_unchecked(3) as usize),
-            *error_ptr.add(*indexes.get_unchecked(4) as usize),
-            *error_ptr.add(*indexes.get_unchecked(5) as usize),
-            *error_ptr.add(*indexes.get_unchecked(6) as usize),
-            *error_ptr.add(*indexes.get_unchecked(7) as usize),
+            *ptr.add(*indexes.get_unchecked(0) as usize),
+            *ptr.add(*indexes.get_unchecked(1) as usize),
+            *ptr.add(*indexes.get_unchecked(2) as usize),
+            *ptr.add(*indexes.get_unchecked(3) as usize),
+            *ptr.add(*indexes.get_unchecked(4) as usize),
+            *ptr.add(*indexes.get_unchecked(5) as usize),
+            *ptr.add(*indexes.get_unchecked(6) as usize),
+            *ptr.add(*indexes.get_unchecked(7) as usize),
         ])
     }
 }
 
 #[inline(always)]
-pub fn scatter_ptr_f32x8(error_ptr: SendPtr<f32>, values: f32x8, indices: u32x8) {
+pub fn scatter_ptr_f32x8(ptr: SendPtr<f32>, values: f32x8, indices: u32x8) {
     let indexes = indices.as_array_ref();
     let vals = values.as_array_ref();
     unsafe {
-        *error_ptr.add(*indexes.get_unchecked(0) as usize) = *vals.get_unchecked(0);
-        *error_ptr.add(*indexes.get_unchecked(1) as usize) = *vals.get_unchecked(1);
-        *error_ptr.add(*indexes.get_unchecked(2) as usize) = *vals.get_unchecked(2);
-        *error_ptr.add(*indexes.get_unchecked(3) as usize) = *vals.get_unchecked(3);
-        *error_ptr.add(*indexes.get_unchecked(4) as usize) = *vals.get_unchecked(4);
-        *error_ptr.add(*indexes.get_unchecked(5) as usize) = *vals.get_unchecked(5);
-        *error_ptr.add(*indexes.get_unchecked(6) as usize) = *vals.get_unchecked(6);
-        *error_ptr.add(*indexes.get_unchecked(7) as usize) = *vals.get_unchecked(7);
+        *ptr.add(*indexes.get_unchecked(0) as usize) = *vals.get_unchecked(0);
+        *ptr.add(*indexes.get_unchecked(1) as usize) = *vals.get_unchecked(1);
+        *ptr.add(*indexes.get_unchecked(2) as usize) = *vals.get_unchecked(2);
+        *ptr.add(*indexes.get_unchecked(3) as usize) = *vals.get_unchecked(3);
+        *ptr.add(*indexes.get_unchecked(4) as usize) = *vals.get_unchecked(4);
+        *ptr.add(*indexes.get_unchecked(5) as usize) = *vals.get_unchecked(5);
+        *ptr.add(*indexes.get_unchecked(6) as usize) = *vals.get_unchecked(6);
+        *ptr.add(*indexes.get_unchecked(7) as usize) = *vals.get_unchecked(7);
     }
 }
 
@@ -133,7 +134,7 @@ pub fn bilinear_interpolate(
 
 
 #[inline(always)]
-pub fn expand_bits(mut v: u32x8) -> u32x8 {
+pub fn expand_bits_simd(mut v: u32x8) -> u32x8 {
     v = v & u32x8::splat(0x0000FFFF);
     v = (v | (v << 8)) & u32x8::splat(0x00FF00FF);
     v = (v | (v << 4)) & u32x8::splat(0x0F0F0F0F);
@@ -143,7 +144,22 @@ pub fn expand_bits(mut v: u32x8) -> u32x8 {
 }
 
 #[inline(always)]
-pub fn morton_code(x: u32x8, y: u32x8) -> u32x8 {
+pub fn expand_bits(mut v: u32) -> u32 {
+    v = v & 0x0000FFFF;
+    v = (v | (v << 8)) & 0x00FF00FF;
+    v = (v | (v << 4)) & 0x0F0F0F0F;
+    v = (v | (v << 2)) & 0x33333333;
+    v = (v | (v << 1)) & 0x55555555;
+    v
+}
+
+#[inline(always)]
+pub fn morton_code_simd(x: u32x8, y: u32x8) -> u32x8 {
+    expand_bits_simd(x) | (expand_bits_simd(y) << 1)
+}
+
+#[inline(always)]
+pub fn morton_code(x: u32, y: u32) -> u32 {
     expand_bits(x) | (expand_bits(y) << 1)
 }
 
@@ -289,8 +305,8 @@ unsafe fn add_to_mac(
 }
 
 #[inline(always)]
-unsafe fn add_to_density(
-    density_ptr: SendPtr<AtomicU32>,
+unsafe fn add_to_vec_f32(
+    vec_ptr: SendPtr<AtomicU32>,
     indices: &[u32; 8],
     weights: &[f32; 8],
     active_lanes: usize
@@ -308,7 +324,7 @@ unsafe fn add_to_density(
                     processed |= 1 << other;
                 }
             }
-            atomic_add_f32(&*density_ptr.add(index), weight);
+            atomic_add_f32(&*vec_ptr.add(index), weight);
         }
     }
 }
@@ -392,7 +408,7 @@ impl MultiGridLevel {
         }
     }
 
-    pub fn smooth_level(&mut self, iterations: usize, reverse: bool) {
+    pub fn smooth_level(&mut self, iterations: usize, reverse: bool, omega: f32) {
 
 
         let width = self.width as usize;
@@ -427,7 +443,10 @@ impl MultiGridLevel {
                             sum = (-plus_y.get_unchecked(cell_index - width)).mul_add(*error_ptr.add(cell_index - width), sum);
                         }
                         
-                        *error_ptr.add(cell_index) = sum * inv_diag;
+                        let gs_value = sum * inv_diag;
+                        let old_error = *error_ptr.add(cell_index);
+
+                        *error_ptr.add(cell_index) = old_error + (omega * (gs_value - old_error));
                     }
                 }
             }
@@ -467,6 +486,7 @@ impl MultiGridLevel {
             let coarse_y = coarse_index / coarse.width as u32; 
 
             let mut sum = 0.0;
+            
             for dy in 0..2 {
                 for dx in 0..2 {
                     let fine_x = coarse_x * 2 + dx;
@@ -834,7 +854,7 @@ impl Apic {
             let grid_x: u32x8 = bytemuck::cast(grid_space_positions.x.fast_max(f32x8::ZERO).fast_min(max_x).fast_trunc_int());
             let grid_y: u32x8 = bytemuck::cast(grid_space_positions.y.fast_max(f32x8::ZERO).fast_min(max_y).fast_trunc_int());
 
-            let grid_indexes: u32x8 = morton_code(grid_x, grid_y);
+            let grid_indexes: u32x8 = morton_code_simd(grid_x, grid_y);
 
             let active_lanes = sort_chunk.len();
             for lane in 0..active_lanes {
@@ -913,9 +933,11 @@ impl Apic {
         let u_tx = u_grid_x - u_base_x;
         let u_ty = u_grid_y - u_base_y;
         
-        let u_weight_bottom_left = (one - u_tx) * (one - u_ty);
-        let u_weight_bottom_right = u_tx * (one - u_ty);
-        let u_weight_top_left = (one - u_tx) * u_ty;
+        let inv_tx = one - u_tx;
+        let inv_ty = one - u_ty;
+        let u_weight_bottom_left = inv_tx * inv_ty;
+        let u_weight_bottom_right = u_tx * inv_ty;
+        let u_weight_top_left = inv_tx * u_ty;
         let u_weight_top_right = u_tx * u_ty;
 
         return (
@@ -946,9 +968,11 @@ impl Apic {
         let v_tx = v_grid_x - v_base_x;
         let v_ty = v_grid_y - v_base_y;
         
-        let v_weight_bottom_left = (one - v_tx) * (one - v_ty);
-        let v_weight_bottom_right = v_tx * (one - v_ty);
-        let v_weight_top_left = (one - v_tx) * v_ty;
+        let inv_tx = one - v_tx;
+        let inv_ty = one - v_ty;
+        let v_weight_bottom_left = inv_tx * inv_ty;
+        let v_weight_bottom_right = v_tx * inv_ty;
+        let v_weight_top_left = inv_tx * v_ty;
         let v_weight_top_right = v_tx * v_ty;
 
         let v_base_x_index = v_base_x.fast_trunc_int();
@@ -978,15 +1002,17 @@ impl Apic {
         let dx = f32x8::splat(cell_size);
         let one = f32x8::splat(1.0);
 
+        let inv_tx = one - tx;
+        let inv_ty = one - ty;
         return (
             -tx * dx,
             -ty * dx,
-            (one - tx) * dx,
+            inv_tx * dx,
             -ty * dx,
             -tx * dx,
-            (one - ty) * dx,
-            (one - tx) * dx,
-            (one - ty) * dx
+            inv_ty * dx,
+            inv_tx * dx,
+            inv_ty * dx
         );
     }
 
@@ -1193,10 +1219,10 @@ impl Apic {
                 add_to_mac(atomic_v_and_wt, vtl_idx, v_add_top_left_arr, v_wt_top_left_arr, active_lanes);
                 add_to_mac(atomic_v_and_wt, vtr_idx, v_add_top_right_arr, v_wt_top_right_arr, active_lanes);
 
-                add_to_density(atomic_density, cbl_idx, c_wt_back_left_arr, active_lanes);
-                add_to_density(atomic_density, cbr_idx, c_wt_back_right_arr, active_lanes);
-                add_to_density(atomic_density, ctl_idx, c_wt_top_left_arr, active_lanes);
-                add_to_density(atomic_density, ctr_idx, c_wt_top_right_arr, active_lanes);
+                add_to_vec_f32(atomic_density, cbl_idx, c_wt_back_left_arr, active_lanes);
+                add_to_vec_f32(atomic_density, cbr_idx, c_wt_back_right_arr, active_lanes);
+                add_to_vec_f32(atomic_density, ctl_idx, c_wt_top_left_arr, active_lanes);
+                add_to_vec_f32(atomic_density, ctr_idx, c_wt_top_right_arr, active_lanes);
             }
         });
 
@@ -1317,25 +1343,6 @@ impl Apic {
                     fluid_mask &= fluid_mask - 1;
                 }
             }
-
-            let remainder_red = coarse_grid.red_indices.len() % 8;
-            if remainder_red != 0 {
-                let padding = 8 - remainder_red;
-                let last_val = coarse_grid.red_indices[coarse_grid.red_indices.len() - 1];
-                for _ in 0..padding {
-                    coarse_grid.red_indices.push(last_val);
-                }
-            }
-
-            let remainder_black = coarse_grid.black_indices.len() % 8;
-            if remainder_black != 0 {
-                let padding = 8 - remainder_black;
-                let last_val = coarse_grid.black_indices[coarse_grid.black_indices.len() - 1];
-                for _ in 0..padding {
-                    coarse_grid.black_indices.push(last_val);
-                }
-            }
-            
 
             for cell_index in &coarse_grid.fluid_indices {
                 let coarse_index = *cell_index as usize;
@@ -1563,7 +1570,7 @@ impl Apic {
     pub fn apply_preconditioner(&mut self) {
         self.base_grid.error.fill(0.0);
 
-        self.base_grid.smooth_level(2, false);
+        self.base_grid.smooth_level(1, false, 1.2);
 
         if self.multigrid_levels.len() > 0 {
             self.base_grid.restrict(&mut self.multigrid_levels[0]);
@@ -1571,26 +1578,26 @@ impl Apic {
             let last = self.multigrid_levels.len() - 1;
 
             for level_index in 0..last {
-                self.multigrid_levels[level_index].smooth_level(2, false);
+                self.multigrid_levels[level_index].smooth_level(1, false, 1.2);
 
                 let (left, right) = self.multigrid_levels.split_at_mut(level_index + 1);
                 left[level_index].restrict(&mut right[0]);
             }
 
-            self.multigrid_levels[last].smooth_level(5, false);
-            self.multigrid_levels[last].smooth_level(5, true);
+            self.multigrid_levels[last].smooth_level(5, false, 1.2);
+            self.multigrid_levels[last].smooth_level(5, true, 1.2);
 
             for level_index in (0..last).rev() {
                 let (left, right) = self.multigrid_levels.split_at_mut(level_index + 1);
                 left[level_index].prolongate(&right[0]);
 
-                self.multigrid_levels[level_index].smooth_level(2, true);
+                self.multigrid_levels[level_index].smooth_level(1, true, 1.2);
             }
 
             self.base_grid.prolongate(&self.multigrid_levels[0]);
         }
 
-        self.base_grid.smooth_level(2, true);
+        self.base_grid.smooth_level(1, true, 1.2);
     }
 
     #[inline(always)]
@@ -2033,31 +2040,31 @@ impl Apic {
                 let old_grid_u = &self.old_grid_u;
                 let next_valid_u = &self.next_valid_u;
 
-                self.mac_u.par_iter_mut()
-                    .zip(self.mac_valid_u.par_iter_mut())
+                self.mac_u.par_chunks_mut(width + 1)
+                    .zip(self.mac_valid_u.par_chunks_mut(width + 1))
                     .enumerate()
-                    .with_min_len(512)
-                    .for_each(|(index, (u, valid))| {
-                    if next_valid_u[index] {
-                        *u = old_grid_u[index];
-                        *valid = true;
-                    } else {
-                        let mut sum: f32 = 0.0;
-                        let mut count: u32 = 0;
-                        let x = index % (width + 1);
-                        let y = index / (width + 1);
-
-                        if x > 0 && next_valid_u[index - 1] { sum += old_grid_u[index - 1]; count += 1; }
-                        if x < width && next_valid_u[index + 1] { sum += old_grid_u[index + 1]; count += 1; }
-                        if y > 0 && next_valid_u[index - (width + 1)] { sum += old_grid_u[index - (width + 1)]; count += 1; }
-                        if y < height - 1 && next_valid_u[index + width + 1] { sum += old_grid_u[index + width + 1]; count += 1; }
-
-                        if count > 0 {
-                            *u = sum / (count as f32);
-                            *valid = true;
+                    .for_each(|(y, (u, valid))| {
+                    for x in 0..=width {
+                        let index = y * (width + 1) + x;
+                        if next_valid_u[index] {
+                            u[x] = old_grid_u[index];
+                            valid[x] = true;
                         } else {
-                            *u = old_grid_u[index];
-                            *valid = false;
+                            let mut sum: f32 = 0.0;
+                            let mut count: u32 = 0;
+
+                            if x > 0 && next_valid_u[index - 1] { sum += old_grid_u[index - 1]; count += 1; }
+                            if x < width && next_valid_u[index + 1] { sum += old_grid_u[index + 1]; count += 1; }
+                            if y > 0 && next_valid_u[index - (width + 1)] { sum += old_grid_u[index - (width + 1)]; count += 1; }
+                            if y < height - 1 && next_valid_u[index + width + 1] { sum += old_grid_u[index + width + 1]; count += 1; }
+
+                            if count > 0 {
+                                u[x] = sum / (count as f32);
+                                valid[x] = true;
+                            } else {
+                                u[x] = old_grid_u[index];
+                                valid[x] = false;
+                            }
                         }
                     }
                 });
@@ -2073,31 +2080,31 @@ impl Apic {
                 let old_grid_v = &self.old_grid_v;
                 let next_valid_v = &self.next_valid_v;
 
-                self.mac_v.par_iter_mut()
-                    .zip(self.mac_valid_v.par_iter_mut())
+                self.mac_v.par_chunks_mut(width)
+                    .zip(self.mac_valid_v.par_chunks_mut(width))
                     .enumerate()
-                    .with_min_len(512)
-                    .for_each(|(index, (v, valid))| {
-                    if next_valid_v[index] {
-                        *v = old_grid_v[index];
-                        *valid = true;
-                    } else {
-                        let mut sum: f32 = 0.0;
-                        let mut count: u32 = 0;
-                        let x = index % width;
-                        let y = index / width;
-
-                        if x > 0 && next_valid_v[index - 1] { sum += old_grid_v[index - 1]; count += 1; }
-                        if x < width - 1 && next_valid_v[index + 1] { sum += old_grid_v[index + 1]; count += 1; }
-                        if y > 0 && next_valid_v[index - width] { sum += old_grid_v[index - width]; count += 1; }
-                        if y < height && next_valid_v[index + width] { sum += old_grid_v[index + width]; count += 1; }
-
-                        if count > 0 {
-                            *v = sum / (count as f32);
-                            *valid = true;
+                    .for_each(|(y, (v, valid))| {
+                    for x in 0..width {
+                        let index = y * width + x;
+                        if next_valid_v[index] {
+                            v[x] = old_grid_v[index];
+                            valid[x] = true;
                         } else {
-                            *v = old_grid_v[index];
-                            *valid = false;
+                            let mut sum: f32 = 0.0;
+                            let mut count: u32 = 0;
+
+                            if x > 0 && next_valid_v[index - 1] { sum += old_grid_v[index - 1]; count += 1; }
+                            if x < width - 1 && next_valid_v[index + 1] { sum += old_grid_v[index + 1]; count += 1; }
+                            if y > 0 && next_valid_v[index - width] { sum += old_grid_v[index - width]; count += 1; }
+                            if y < height && next_valid_v[index + width] { sum += old_grid_v[index + width]; count += 1; }
+
+                            if count > 0 {
+                                v[x] = sum / (count as f32);
+                                valid[x] = true;
+                            } else {
+                                v[x] = old_grid_v[index];
+                                valid[x] = false;
+                            }
                         }
                     }
                 });
