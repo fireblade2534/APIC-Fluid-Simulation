@@ -46,6 +46,30 @@ pub fn temporal_kernel_w_t(tau: f32x8) -> f32x8 {
 }
 
 #[inline(always)]
+pub fn gather_f32x8_bits(slice: &[u64], indices: u32x8) -> f32x8 {
+    unsafe {
+        let word_indexes: [u32; 8]  = (indices >> 6u32).to_array();
+        let bit_indexes: [u32; 8] = (indices & u32x8::splat(63)).to_array();
+
+        let bits = u32x8::from([
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(0) as usize) >> *bit_indexes.get_unchecked(0)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(1) as usize) >> *bit_indexes.get_unchecked(1)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(2) as usize) >> *bit_indexes.get_unchecked(2)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(3) as usize) >> *bit_indexes.get_unchecked(3)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(4) as usize) >> *bit_indexes.get_unchecked(4)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(5) as usize) >> *bit_indexes.get_unchecked(5)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(6) as usize) >> *bit_indexes.get_unchecked(6)) & 1) as u32,
+            ((*slice.get_unchecked(*word_indexes.get_unchecked(7) as usize) >> *bit_indexes.get_unchecked(7)) & 1) as u32,
+        ]);
+
+        let mask_bits = u32x8::ZERO - bits;
+
+        return bytemuck::cast(mask_bits)
+    }
+}
+
+
+#[inline(always)]
 pub fn gather_f32x8(slice: &[f32], indices: u32x8) -> f32x8 {
     let indexes = indices.as_array_ref();
     unsafe {
@@ -122,12 +146,27 @@ pub fn bilinear_interpolate(
     velocity_top_left: f32x8, 
     velocity_top_right: f32x8
 ) -> f32x8 {
+    let weight_sum = weight_bottom_left + weight_bottom_right + weight_top_left + weight_top_right;
+
+    let inv_weight_sum = f32x8::splat(1.0) / weight_sum.fast_max(f32x8::splat(1e-6));
+
     let mut velocity = f32x8::ZERO;
-    
-    velocity += velocity_bottom_left * weight_bottom_left;
-    velocity += velocity_bottom_right * weight_bottom_right;
-    velocity += velocity_top_left * weight_top_left;
-    velocity += velocity_top_right * weight_top_right;
+
+    velocity += velocity_bottom_left
+        * weight_bottom_left
+        * inv_weight_sum;
+
+    velocity += velocity_bottom_right
+        * weight_bottom_right
+        * inv_weight_sum;
+
+    velocity += velocity_top_left
+        * weight_top_left
+        * inv_weight_sum;
+
+    velocity += velocity_top_right
+        * weight_top_right
+        * inv_weight_sum;
 
     return velocity;
 }
@@ -353,6 +392,11 @@ unsafe fn add_to_fluid(
             (*fluid_ptr.add(word_idx)).fetch_or(mask, Relaxed);
         }
     }
+}
+
+#[derive(Default)]
+pub struct DebugOptions {
+    pub disable_particle_sort: bool,
 }
 
 #[derive(Default)]
@@ -628,7 +672,7 @@ impl MultiGridLevel {
                 let fluid_index = *index as usize;
                 unsafe {
                     *self.error.get_unchecked_mut(fluid_index) += alpha * *self.cg_search.get_unchecked(fluid_index);
-                    *self.cg_search.get_unchecked_mut(fluid_index) -= alpha * *self.cg_ap.get_unchecked(fluid_index);
+                    *self.cg_residual.get_unchecked_mut(fluid_index) -= alpha * *self.cg_ap.get_unchecked(fluid_index);
 
                     max_error = max_error.max(self.cg_residual.get_unchecked(fluid_index).abs())
                 }
@@ -698,6 +742,9 @@ pub struct Apic {
     pub mac_v_and_weight: Vec<u64>,
     pub mac_density: Vec<f32>,
 
+    pub mac_u_blocked: Vec<u64>,
+    pub mac_v_blocked: Vec<u64>,
+
     pub old_grid_u: Vec<f32>,
     pub old_grid_v: Vec<f32>,
     pub next_valid_u: Vec<bool>,
@@ -758,6 +805,9 @@ impl Apic {
         flip.mac_u_and_weight.resize((flip.cells + flip.height) as usize, 0);
         flip.mac_v_and_weight.resize((flip.cells + flip.width) as usize, 0);
         flip.mac_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
+
+        flip.mac_u_blocked.resize((flip.cells + flip.height).div_ceil(64) as usize, 0);
+        flip.mac_v_blocked.resize((flip.cells + flip.width).div_ceil(64) as usize, 0);
 
         flip.smoothed_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
         flip.old_density.resize((flip.cells.div_ceil(8) * 8) as usize, 0.0);
@@ -860,7 +910,37 @@ impl Apic {
         let last = flip.multigrid_levels.len() - 1;
         flip.multigrid_levels[last].allocate_cg();
 
+        flip.update_world();
+
         return flip;
+    }
+
+    pub fn update_world(&mut self) {
+        self.mac_u_blocked.fill(0);
+        for index in 0..self.mac_u.len() {
+            let i = index % (self.width as usize + 1);
+            let j = index / (self.width as usize + 1);
+
+            let left = self.is_obstacle(i as i32 - 1, j as i32);
+            let right = self.is_obstacle(i as i32, j as i32);
+
+            if (left | right) == 0 {
+                self.mac_u_blocked[index >> 6] |= 1u64 << (index & 63);
+            }
+        }
+
+        self.mac_v_blocked.fill(0);
+        for index in 0..self.mac_v.len() {
+            let i = index % self.width as usize;
+            let j = index / self.width as usize;
+
+            let bottom = self.is_obstacle(i as i32, j as i32 - 1);
+            let top = self.is_obstacle(i as i32, j as i32);
+
+            if (bottom | top) == 0 {
+                self.mac_v_blocked[index >> 6] |= 1u64 << (index & 63);
+            }
+        }
     }
 
     #[inline(always)]
@@ -1983,6 +2063,9 @@ impl Apic {
         let max_y = f32x8::splat((self.height as f32 - 1.001) * self.cell_size);
 
         let zero = f32x8::ZERO;
+        let h2 = f32x8::splat(self.cell_size * self.cell_size);
+        let one = f32x8::splat(1.0);
+        let eps = f32x8::splat(1e-6);
 
         let width = self.width;
         let height = self.height;
@@ -2064,10 +2147,10 @@ impl Apic {
             let v_node_tr = gather_f32x8(mac_grid_v, v_index_top_right);
 
             let u_velocity = bilinear_interpolate(
-                u_weight_bottom_left,
-                u_weight_bottom_right,
-                u_weight_top_left,
-                u_weight_top_right,
+                gather_f32x8_bits(&self.mac_u_blocked, u_index_bottom_left) & u_weight_bottom_left,
+                gather_f32x8_bits(&self.mac_u_blocked, u_index_bottom_right) & u_weight_bottom_right,
+                gather_f32x8_bits(&self.mac_u_blocked, u_index_top_left) & u_weight_top_left,
+                gather_f32x8_bits(&self.mac_u_blocked, u_index_top_right) & u_weight_top_right,
                 u_node_bl,
                 u_node_br,
                 u_node_tl,
@@ -2075,10 +2158,10 @@ impl Apic {
             );
 
             let v_velocity = bilinear_interpolate(
-                v_weight_bottom_left,
-                v_weight_bottom_right,
-                v_weight_top_left,
-                v_weight_top_right,
+                gather_f32x8_bits(&self.mac_v_blocked, v_index_bottom_left) & v_weight_bottom_left,
+                gather_f32x8_bits(&self.mac_v_blocked, v_index_bottom_right) & v_weight_bottom_right,
+                gather_f32x8_bits(&self.mac_v_blocked, v_index_top_left) & v_weight_top_left,
+                gather_f32x8_bits(&self.mac_v_blocked, v_index_top_right) & v_weight_top_right,
                 v_node_bl,
                 v_node_br,
                 v_node_tl,
@@ -2125,7 +2208,18 @@ impl Apic {
             new_velocity.y = out_vel_y_min.blend(new_velocity.y * border_damping, new_velocity.y);
             new_velocity.y = out_vel_y_max.blend(new_velocity.y * border_damping, new_velocity.y);
 
-            let d_inv = f32x8::splat(4.0 / (cell_size * cell_size));
+            let u_d_x = h2 * u_tx * (one - u_tx);
+            let u_d_y = h2 * u_ty * (one - u_ty);
+
+            let v_d_x = h2 * v_tx * (one - v_tx);
+            let v_d_y = h2 * v_ty * (one - v_ty);
+
+            let u_d_inv_x = u_d_x.cmp_gt(eps).blend(one / u_d_x, f32x8::ZERO);
+            let u_d_inv_y = u_d_y.cmp_gt(eps).blend(one / u_d_y, f32x8::ZERO);
+
+            let v_d_inv_x = v_d_x.cmp_gt(eps).blend(one / v_d_x, f32x8::ZERO);
+            let v_d_inv_y = v_d_y.cmp_gt(eps).blend(one / v_d_y, f32x8::ZERO);
+
 
             let mut c_u_x = f32x8::ZERO;
             let mut c_u_y = f32x8::ZERO;
@@ -2149,8 +2243,8 @@ impl Apic {
             c_v_x += v_weight_top_right * v_node_tr * v_diff_top_right_x;
             c_v_y += v_weight_top_right * v_node_tr * v_diff_top_right_y;
 
-            let mut c_u = Vec2x8 { x: c_u_x * d_inv, y: c_u_y * d_inv };
-            let mut c_v = Vec2x8 { x: c_v_x * d_inv, y: c_v_y * d_inv };
+            let mut c_u = Vec2x8 { x: c_u_x * u_d_inv_x, y: c_u_y * u_d_inv_y };
+            let mut c_v = Vec2x8 { x: c_v_x * v_d_inv_x, y: c_v_y * v_d_inv_y };
 
             let reflect_x = out_vel_x_min | out_vel_x_max;
             let reflect_y = out_vel_y_min | out_vel_y_max;
@@ -2332,10 +2426,9 @@ impl Apic {
         return max_velocity;
     }
 
-    pub fn update(&mut self, frame_deltatime: f32) {
+    pub fn update(&mut self, debug_options: &DebugOptions, frame_deltatime: f32) {
         let mut time_simulated = 0.0;
- 
-    
+
         while time_simulated < frame_deltatime {
             let max_velocity = self.get_max_particle_velocity();
             
@@ -2347,7 +2440,9 @@ impl Apic {
 
             let step_deltatime = max_safe_dt.min(frame_deltatime - time_simulated);
             
-            self.update_spatial_lookup();
+            if !debug_options.disable_particle_sort && time_simulated == 0.0 {
+                self.update_spatial_lookup();
+            }
             self.transfer_particles_to_grid(step_deltatime, self.timestamp);
             self.apply_external_forces(step_deltatime);
             self.build_pressure_system();

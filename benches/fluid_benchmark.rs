@@ -1,4 +1,4 @@
-use FLIP::apic::{Apic, WorldProperties};
+use FLIP::apic::{Apic, DebugOptions, WorldProperties};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 
@@ -29,13 +29,13 @@ fn bench_fluid_update(c: &mut Criterion) {
                 // and pressures are 0. We step the simulation forward a few frames so 
                 // gravity accelerates the particles and the PCG solver actually has to work.
                 for _ in 0..15 {
-                    flip.update(0.016); // 60 FPS delta time
+                    flip.update(&DebugOptions { disable_particle_sort: false },0.016); // 60 FPS delta time
                 }
 
                 // Run the actual benchmark iteration
                 b.iter(|| {
                     // black_box prevents the compiler from overly optimizing the loop
-                    flip.update(black_box(0.016));
+                    flip.update(&DebugOptions { disable_particle_sort: false }, black_box(0.016));
                 });
             },
         );
